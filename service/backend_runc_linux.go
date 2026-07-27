@@ -62,6 +62,7 @@ const (
 	configFileName        = "config.json"
 	rootfsDirName         = "rootfs"
 	manifestFileName      = "mysterium-runtime.json"
+	cgroupParentEnv       = "MYSTERIUM_CGROUP_PARENT"
 	defaultCPUPeriod      = uint64(100000)
 	stopTimeout           = 5 * time.Second
 	runcOperationTimeout  = 30 * time.Second
@@ -126,9 +127,19 @@ func newRuncBackend(runtimeDir string) *RuncBackend {
 }
 
 func (backend *RuncBackend) initialize() error {
-	for _, dir := range []string{backend.baseDir, backend.bundlesDir, backend.runc.Root} {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return errors.Wrapf(err, "failed to create runtime backend directory %q", dir)
+	for _, dir := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{path: backend.baseDir, mode: 0o711},
+		{path: backend.bundlesDir, mode: 0o711},
+		{path: backend.runc.Root, mode: 0o700},
+	} {
+		if err := os.MkdirAll(dir.path, dir.mode); err != nil {
+			return errors.Wrapf(err, "failed to create runtime backend directory %q", dir.path)
+		}
+		if err := os.Chmod(dir.path, dir.mode); err != nil {
+			return errors.Wrapf(err, "failed to secure runtime backend directory %q", dir.path)
 		}
 	}
 
@@ -178,6 +189,9 @@ func (backend *RuncBackend) Create(input CreateOptions) error {
 		return errors.Wrapf(err, "failed to stage bundle for %q", input.Name)
 	}
 	defer os.RemoveAll(stagingDir)
+	if err := os.Chmod(stagingDir, 0o711); err != nil {
+		return errors.Wrapf(err, "failed to make staged bundle traversable for %q", input.Name)
+	}
 	if err := os.MkdirAll(filepath.Join(stagingDir, rootfsDirName), 0o755); err != nil {
 		return errors.Wrapf(err, "failed to create bundle rootfs for %q", input.Name)
 	}
@@ -492,9 +506,13 @@ func (backend *RuncBackend) prepareBundleLocked(input CreateOptions, bundleDir s
 	if err != nil {
 		return Options{}, err
 	}
+	uidMappings, gidMappings, err := loadUserMappings()
+	if err != nil {
+		return Options{}, err
+	}
 
 	rootfsPath := filepath.Join(bundleDir, rootfsDirName)
-	if err := extractImageRootFS(img, rootfsPath, maxRootFSSize); err != nil {
+	if err := extractImageRootFS(img, rootfsPath, maxRootFSSize, uidMappings, gidMappings); err != nil {
 		return Options{}, err
 	}
 	manifest, err := readManifest(rootfsPath)
@@ -531,6 +549,10 @@ func (backend *RuncBackend) writeSpec(bundleDir string, options Options) error {
 		return errors.New("manifest disk resource limit is invalid")
 	}
 	errno := uint(unix.EPERM)
+	cgroupPath, err := cgroupPathForService(options.Name)
+	if err != nil {
+		return err
+	}
 	spec := specs.Spec{
 		Version: specs.Version,
 		Process: &specs.Process{
@@ -556,7 +578,7 @@ func (backend *RuncBackend) writeSpec(bundleDir string, options Options) error {
 		},
 		Annotations: map[string]string{"mysterium.runtime.service": options.Name},
 		Linux: &specs.Linux{
-			CgroupsPath: cgroupPathForService(options.Name),
+			CgroupsPath: cgroupPath,
 			Namespaces: []specs.LinuxNamespace{
 				{Type: specs.PIDNamespace},
 				{Type: specs.NetworkNamespace},
@@ -685,11 +707,28 @@ func (backend *RuncBackend) containerID(name string) string {
 	return name
 }
 
-func extractImageRootFS(img v1.Image, rootfsPath string, maxBytes uint64) error {
+func extractImageRootFS(
+	img v1.Image,
+	rootfsPath string,
+	maxBytes uint64,
+	uidMappings []specs.LinuxIDMapping,
+	gidMappings []specs.LinuxIDMapping,
+) error {
 	stream := mutate.Extract(img)
 	defer stream.Close()
 
 	rootfsPath = filepath.Clean(rootfsPath)
+	rootUID, ok := mapContainerID(uidMappings, 0)
+	if !ok {
+		return errors.New("subordinate UID mapping does not contain container root")
+	}
+	rootGID, ok := mapContainerID(gidMappings, 0)
+	if !ok {
+		return errors.New("subordinate GID mapping does not contain container root")
+	}
+	if err := os.Chown(rootfsPath, int(rootUID), int(rootGID)); err != nil {
+		return errors.Wrap(err, "failed to map OCI rootfs ownership")
+	}
 
 	reader := tar.NewReader(stream)
 	var extractedBytes uint64
@@ -708,6 +747,17 @@ func extractImageRootFS(img v1.Image, rootfsPath string, maxBytes uint64) error 
 		}
 		if err := ensureNoSymlinkParents(rootfsPath, targetPath); err != nil {
 			return errors.Wrapf(err, "unsafe OCI tar entry path %q", header.Name)
+		}
+		if header.Uid < 0 || header.Gid < 0 || uint64(header.Uid) > math.MaxUint32 || uint64(header.Gid) > math.MaxUint32 {
+			return errors.Errorf("OCI tar entry %q has invalid ownership", header.Name)
+		}
+		hostUID, ok := mapContainerID(uidMappings, uint32(header.Uid))
+		if !ok {
+			return errors.Errorf("OCI tar entry %q UID %d is outside the subordinate mapping", header.Name, header.Uid)
+		}
+		hostGID, ok := mapContainerID(gidMappings, uint32(header.Gid))
+		if !ok {
+			return errors.Errorf("OCI tar entry %q GID %d is outside the subordinate mapping", header.Name, header.Gid)
 		}
 
 		switch header.Typeflag {
@@ -757,6 +807,9 @@ func extractImageRootFS(img v1.Image, rootfsPath string, maxBytes uint64) error 
 			return errors.Errorf("OCI rootfs entry %q uses unsupported file type %d", header.Name, header.Typeflag)
 		}
 
+		if err := os.Lchown(targetPath, int(hostUID), int(hostGID)); err != nil {
+			return errors.Wrapf(err, "failed to map ownership for OCI tar entry %q", header.Name)
+		}
 		if header.Typeflag != tar.TypeSymlink {
 			if err := os.Chtimes(targetPath, header.AccessTime, header.ModTime); err != nil && !os.IsNotExist(err) {
 				return errors.Wrapf(err, "failed to update times for %q", targetPath)
@@ -1055,6 +1108,7 @@ func assessAvailability(caps capabilities.RuntimeCapabilities, initErr error) (b
 		{7, "CAP_SETUID"},
 		{12, "CAP_NET_ADMIN"},
 		{18, "CAP_SYS_CHROOT"},
+		{19, "CAP_SYS_PTRACE"},
 		{21, "CAP_SYS_ADMIN"},
 		{27, "CAP_MKNOD"},
 	}
@@ -1097,18 +1151,10 @@ func assessAvailability(caps capabilities.RuntimeCapabilities, initErr error) (b
 }
 
 func requireDelegatedCgroupControllers(required ...string) error {
-	data, err := os.ReadFile("/proc/self/cgroup")
+	_, root, err := delegatedCgroupParent()
 	if err != nil {
-		return errors.Wrap(err, "cannot read current cgroup")
+		return err
 	}
-	currentPath := "/"
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "0::") {
-			currentPath = strings.TrimSpace(strings.TrimPrefix(line, "0::"))
-			break
-		}
-	}
-	root := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(filepath.Clean(currentPath), "/"))
 	enabledData, err := os.ReadFile(filepath.Join(root, "cgroup.subtree_control"))
 	if err != nil {
 		return errors.Wrap(err, "cannot read delegated cgroup controllers")
@@ -1127,6 +1173,32 @@ func requireDelegatedCgroupControllers(required ...string) error {
 		return errors.Errorf("delegated cgroup controllers are not enabled: %s", strings.Join(missing, ", "))
 	}
 	return nil
+}
+
+func delegatedCgroupParent() (string, string, error) {
+	currentPath := strings.TrimSpace(os.Getenv(cgroupParentEnv))
+	if currentPath == "" {
+		data, err := os.ReadFile("/proc/self/cgroup")
+		if err != nil {
+			return "", "", errors.Wrap(err, "cannot read current cgroup")
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "0::") {
+				currentPath = strings.TrimSpace(strings.TrimPrefix(line, "0::"))
+				break
+			}
+		}
+	}
+	if currentPath == "" || !filepath.IsAbs(currentPath) {
+		return "", "", errors.Errorf("invalid delegated cgroup parent %q", currentPath)
+	}
+
+	currentPath = filepath.Clean(currentPath)
+	root := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(currentPath, "/"))
+	if !isPathWithinRoot("/sys/fs/cgroup", root) {
+		return "", "", errors.Errorf("delegated cgroup parent %q escapes cgroup v2", currentPath)
+	}
+	return currentPath, root, nil
 }
 
 func hasEffectiveCapability(bit uint) bool {
@@ -1188,6 +1260,20 @@ func mappingContains(mappings []specs.LinuxIDMapping, id uint32) bool {
 	return false
 }
 
+func mapContainerID(mappings []specs.LinuxIDMapping, id uint32) (uint32, bool) {
+	for _, mapping := range mappings {
+		if id < mapping.ContainerID || uint64(id) >= uint64(mapping.ContainerID)+uint64(mapping.Size) {
+			continue
+		}
+		hostID := uint64(mapping.HostID) + uint64(id-mapping.ContainerID)
+		if hostID > math.MaxUint32 {
+			return 0, false
+		}
+		return uint32(hostID), true
+	}
+	return 0, false
+}
+
 func ensureNoSymlinkParents(root, target string) error {
 	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(target))
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
@@ -1211,7 +1297,7 @@ func ensureNoSymlinkParents(root, target string) error {
 	return nil
 }
 
-func cgroupPathForService(name string) string {
+func cgroupPathForService(name string) (string, error) {
 	var builder strings.Builder
 	builder.Grow(len(name))
 	for _, r := range name {
@@ -1228,7 +1314,11 @@ func cgroupPathForService(name string) string {
 			builder.WriteByte('_')
 		}
 	}
-	return "mysterium-" + builder.String()
+	parent, _, err := delegatedCgroupParent()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, "mysterium-"+builder.String()), nil
 }
 
 func secureJoinUnder(root, tarPath string) (string, error) {

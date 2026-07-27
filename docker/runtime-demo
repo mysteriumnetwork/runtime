@@ -1,0 +1,44 @@
+#!/bin/sh
+set -eu
+
+: "${OCI_ARTIFACT:?set OCI_ARTIFACT to the digest-pinned workload image}"
+
+runtime_dir="${RUNTIME_DIR:-/var/lib/mysterium-runtime}"
+service_name="${SERVICE_NAME:-nc-demo}"
+listen_address="${LISTEN_ADDRESS:-0.0.0.0:3000}"
+
+delegate_cgroups() {
+    current_cgroup="$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)"
+    if [ -z "$current_cgroup" ] || [ "$current_cgroup" = "/" ]; then
+        echo "a host cgroup namespace with a non-root container cgroup is required" >&2
+        exit 1
+    fi
+
+    parent="/sys/fs/cgroup${current_cgroup}"
+    manager="${parent}/mysterium-manager"
+    mkdir -p "$manager"
+    printf '%s\n' "$$" >"${manager}/cgroup.procs"
+    printf '%s\n' '+cpu +memory +pids' >"${parent}/cgroup.subtree_control"
+    export MYSTERIUM_CGROUP_PARENT="$current_cgroup"
+}
+
+cleanup() {
+    if [ -n "${proxy_pid:-}" ]; then
+        kill "$proxy_pid" 2>/dev/null || true
+        wait "$proxy_pid" 2>/dev/null || true
+    fi
+    runtime-cli -runtime-dir "$runtime_dir" -command stop -name "$service_name" || true
+}
+trap cleanup EXIT INT TERM
+
+delegate_cgroups
+runtime-cli -runtime-dir "$runtime_dir" -command capabilities
+runtime-cli -runtime-dir "$runtime_dir" -command create \
+    -name "$service_name" \
+    -oci-artifact "$OCI_ARTIFACT"
+runtime-cli -runtime-dir "$runtime_dir" -command start -name "$service_name"
+runtime-cli -runtime-dir "$runtime_dir" -command proxy \
+    -name "$service_name" \
+    -listen "$listen_address" &
+proxy_pid=$!
+wait "$proxy_pid"

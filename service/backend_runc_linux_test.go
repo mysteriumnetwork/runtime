@@ -20,12 +20,14 @@
 package service
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
 func TestProcessFromImagePreservesOCIArguments(t *testing.T) {
@@ -184,5 +186,44 @@ func TestEnsureNoSymlinkParentsRejectsExtractionThroughSymlink(t *testing.T) {
 func TestCanCreateRuncCgroupPathRejectsTraversal(t *testing.T) {
 	if err := canCreateRuncCgroupPath("../evil"); err == nil {
 		t.Fatal("expected traversal cgroup path to be rejected")
+	}
+}
+
+func TestCgroupPathForServiceUsesDelegatedParent(t *testing.T) {
+	t.Setenv(cgroupParentEnv, "/docker/runtime-demo")
+
+	path, err := cgroupPathForService("service.alpha")
+	if err != nil {
+		t.Fatalf("unexpected delegated cgroup path error: %v", err)
+	}
+	if path != "/docker/runtime-demo/mysterium-service.alpha" {
+		t.Fatalf("unexpected delegated cgroup path %q", path)
+	}
+}
+
+func TestCgroupPathForServiceRejectsRelativeParent(t *testing.T) {
+	t.Setenv(cgroupParentEnv, "../outside")
+
+	if _, err := cgroupPathForService("service.alpha"); err == nil {
+		t.Fatal("expected relative delegated cgroup parent to be rejected")
+	}
+}
+
+func TestMapContainerID(t *testing.T) {
+	mappings := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 100000, Size: 65536}}
+
+	hostID, ok := mapContainerID(mappings, 1000)
+	if !ok || hostID != 101000 {
+		t.Fatalf("unexpected mapped ID %d, mapped=%v", hostID, ok)
+	}
+	if _, ok := mapContainerID(mappings, 65536); ok {
+		t.Fatal("expected ID outside the mapping to be rejected")
+	}
+	if _, ok := mapContainerID([]specs.LinuxIDMapping{{
+		ContainerID: 0,
+		HostID:      math.MaxUint32,
+		Size:        2,
+	}}, 1); ok {
+		t.Fatal("expected overflowing host ID to be rejected")
 	}
 }

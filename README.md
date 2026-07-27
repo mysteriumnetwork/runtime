@@ -77,6 +77,85 @@ go build ./cmd/runtime-cli
 ./runtime-cli -command list
 ```
 
+### Docker demo
+
+The root [`Dockerfile`](Dockerfile) builds an Alpine image containing
+`runtime-cli`, `runc`, and `curl`. The demo workload in
+[`examples/nc-workload`](examples/nc-workload) uses BusyBox `nc` and `cat` to
+return a small HTTP response.
+
+The runtime accepts only registry images referenced by digest, so first publish
+the workload to a registry the runtime container can reach:
+
+```bash
+export WORKLOAD_IMAGE=registry.example/mysterium/nc-workload:demo
+
+docker build -t "$WORKLOAD_IMAGE" examples/nc-workload
+docker push "$WORKLOAD_IMAGE"
+export OCI_ARTIFACT="$(docker image inspect "$WORKLOAD_IMAGE" \
+  --format '{{index .RepoDigests 0}}')"
+
+case "$OCI_ARTIFACT" in
+  *@sha256:*) ;;
+  *) echo "the pushed workload did not resolve to a digest" >&2; exit 1 ;;
+esac
+```
+
+Build the runtime image:
+
+```bash
+docker build -t mysterium-runtime:dev .
+```
+
+Run the end-to-end demo on a native Linux Docker host. Docker Desktop is not a
+supported host for this nested runtime because its VM blocks the subordinate
+user namespace from mounting the workload procfs. The cgroup namespace and cgroup
+filesystem options let the demo wrapper delegate `cpu`, `memory`, and `pids`
+from the container cgroup to sibling workload cgroups managed by nested `runc`.
+The capability list is the exact set currently required by the runtime's
+availability check; the outer Docker seccomp profile is disabled so `runc` can
+install the stricter workload seccomp profile from the generated OCI spec.
+
+```bash
+docker run --rm --name mysterium-runtime-demo \
+  --cgroupns=host \
+  --mount type=bind,src=/sys/fs/cgroup,dst=/sys/fs/cgroup \
+  --cap-drop=ALL \
+  --cap-add=CHOWN \
+  --cap-add=DAC_OVERRIDE \
+  --cap-add=FOWNER \
+  --cap-add=SETGID \
+  --cap-add=SETUID \
+  --cap-add=NET_ADMIN \
+  --cap-add=SYS_CHROOT \
+  --cap-add=SYS_PTRACE \
+  --cap-add=SYS_ADMIN \
+  --cap-add=MKNOD \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
+  -e OCI_ARTIFACT="$OCI_ARTIFACT" \
+  -p 127.0.0.1:3000:3000 \
+  --entrypoint /usr/local/bin/runtime-demo \
+  mysterium-runtime:dev
+```
+
+In a second terminal:
+
+```bash
+curl --fail-with-body http://127.0.0.1:3000/
+```
+
+Expected response:
+
+```text
+hello from the isolated runc workload
+```
+
+The `proxy` command used by the demo is necessary because the workload listens
+only on loopback inside its isolated network namespace. It looks up the
+manifest-defined service port and bridges a local listener through
+`Backend.DialTCP`; it does not add a port override to the workload contract.
+
 ---
 
 ## 2. Capability Detection Strategy

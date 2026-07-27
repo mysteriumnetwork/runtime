@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+while true; do
+    {
+        printf 'HTTP/1.1 200 OK\r\n'
+        printf 'Content-Type: text/plain\r\n'
+        printf 'Connection: close\r\n'
+        printf '\r\n'
+        cat /response.txt
+    } | nc -l -p 3000
+done

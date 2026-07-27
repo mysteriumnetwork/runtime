@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "service": {
+    "protocol": "tcp",
+    "internal_port": 3000
+  },
+  "resources": {
+    "cpu": "0.25",
+    "memory": "32MiB",
+    "disk": "16MiB",
+    "pids": 16
+  }
+}
