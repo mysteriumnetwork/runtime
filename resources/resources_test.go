@@ -27,16 +27,32 @@ import (
 )
 
 func TestFactorySelection(t *testing.T) {
-	cgroupCaps := capabilities.RuntimeCapabilities{WritableCgroupTree: true}
+	cgroupCaps := capabilities.RuntimeCapabilities{CgroupV2: true, WritableCgroupTree: true}
 	limiter := NewResourceLimiter(cgroupCaps)
 	if _, ok := limiter.(*CgroupLimiter); !ok {
-		t.Fatalf("expected CgroupLimiter when WritableCgroupTree is true, got %T", limiter)
+		t.Fatalf("expected CgroupLimiter when cgroup v2 is writable, got %T", limiter)
 	}
 
 	noCgroupCaps := capabilities.RuntimeCapabilities{WritableCgroupTree: false}
 	limiter = NewResourceLimiter(noCgroupCaps)
-	if _, ok := limiter.(*CgroupLimiter); !ok {
-		t.Fatalf("expected fail-closed CgroupLimiter without cgroup capability, got %T", limiter)
+	if _, ok := limiter.(*NoopLimiter); !ok {
+		t.Fatalf("expected NoopLimiter without cgroup capability, got %T", limiter)
+	}
+}
+
+func TestNoopLimiterLifecycle(t *testing.T) {
+	limiter := &NoopLimiter{}
+	if err := limiter.Create("test", ResourceLimits{MemoryBytes: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := limiter.Attach(1); err != nil {
+		t.Fatal(err)
+	}
+	if err := limiter.AttachID("test", 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := limiter.Destroy("test"); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -24,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -97,6 +98,25 @@ func TestValidateStoredOptionsRejectsLegacyMutableDefinition(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected legacy mutable runtime definition to be rejected")
+	}
+}
+
+func TestValidateStoredOptionsAcceptsExplicitUnisolatedPolicy(t *testing.T) {
+	options := testSpecOptions(IsolationProfile{
+		Name:  UnisolatedProfile,
+		Level: RuntimeLevelUnisolated,
+		Features: IsolationFeatures{
+			FilesystemJail:      true,
+			NonRootUser:         true,
+			CapabilitiesDropped: true,
+			NoNewPrivileges:     true,
+		},
+	})
+	options.OCIArtifact = "example.invalid/trusted@sha256:" + strings.Repeat("0", 64)
+	options.MinimumRuntimeLevel = RuntimeLevelUnisolated
+
+	if err := validateStoredOptions(options); err != nil {
+		t.Fatalf("validateStoredOptions() error = %v", err)
 	}
 }
 
@@ -226,4 +246,207 @@ func TestMapContainerID(t *testing.T) {
 	}}, 1); ok {
 		t.Fatal("expected overflowing host ID to be rejected")
 	}
+}
+
+func TestBuildOCISpecUsesLimitedIsolationProfile(t *testing.T) {
+	options := testSpecOptions(IsolationProfile{
+		Name:  BestEffortIsolationProfile,
+		Level: RuntimeLevelLimited,
+		Features: IsolationFeatures{
+			MountNamespaces: true,
+			NoNewPrivileges: true,
+		},
+	})
+
+	spec, err := buildOCISpec(options, nil, nil, "", 64*1024*1024)
+	if err != nil {
+		t.Fatalf("buildOCISpec() error = %v", err)
+	}
+	if spec.Root.Readonly {
+		t.Fatal("limited profile unexpectedly made the rootfs read-only")
+	}
+	if spec.Linux.Seccomp != nil || spec.Linux.Resources != nil || spec.Linux.CgroupsPath != "" {
+		t.Fatalf("limited profile enabled unavailable controls: %#v", spec.Linux)
+	}
+	if len(spec.Linux.UIDMappings) != 0 || len(spec.Linux.GIDMappings) != 0 {
+		t.Fatal("limited profile unexpectedly configured user namespace mappings")
+	}
+	if hasNamespace(spec.Linux.Namespaces, specs.UserNamespace) ||
+		hasNamespace(spec.Linux.Namespaces, specs.PIDNamespace) ||
+		hasNamespace(spec.Linux.Namespaces, specs.NetworkNamespace) ||
+		hasNamespace(spec.Linux.Namespaces, specs.IPCNamespace) {
+		t.Fatalf("limited profile enabled unavailable namespaces: %#v", spec.Linux.Namespaces)
+	}
+	if !hasNamespace(spec.Linux.Namespaces, specs.MountNamespace) {
+		t.Fatal("limited profile is missing its required mount namespace")
+	}
+}
+
+func TestValidateUnisolatedProfile(t *testing.T) {
+	profile := IsolationProfile{
+		Name:  UnisolatedProfile,
+		Level: RuntimeLevelUnisolated,
+		Features: IsolationFeatures{
+			FilesystemJail:      true,
+			NonRootUser:         true,
+			CapabilitiesDropped: true,
+			NoNewPrivileges:     true,
+		},
+	}
+	if err := validateIsolationProfile(profile); err != nil {
+		t.Fatalf("validateIsolationProfile() error = %v", err)
+	}
+
+	profile.Features.NetworkNamespaces = true
+	if err := validateIsolationProfile(profile); err == nil {
+		t.Fatal("unisolated profile claimed a namespace without being rejected")
+	}
+}
+
+func TestDirectProcessIdentityMatchesCurrentProcess(t *testing.T) {
+	state, ok := directProcessIdentity(os.Getpid())
+	if !ok {
+		t.Fatal("current process identity was not detected")
+	}
+	if !directProcessMatches(state) {
+		t.Fatal("current process identity did not match itself")
+	}
+	state.StartTime++
+	if directProcessMatches(state) {
+		t.Fatal("mismatched process start time was accepted")
+	}
+}
+
+func TestDirectExecutorLaunchesAndStopsWithoutRunc(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("direct executor integration test requires root")
+	}
+	for _, capability := range []uint{5, 6, 7, 18} {
+		if !hasEffectiveCapability(capability) {
+			t.Skipf("%s is unavailable", effectiveCapabilityName(capability))
+		}
+	}
+	executable := ""
+	for _, candidate := range []string{"/usr/bin/sleep", "/bin/sleep"} {
+		if _, err := os.Stat(candidate); err == nil {
+			executable = candidate
+			break
+		}
+	}
+	if executable == "" {
+		t.Skip("sleep executable is unavailable")
+	}
+
+	configPath := filepath.Join(t.TempDir(), "direct-launch.json")
+	config := directLaunchConfig{
+		RootFS: "/",
+		Process: ProcessDefinition{
+			Args: []string{executable, "30"},
+			Env:  []string{"PATH=/usr/bin:/bin"},
+			Cwd:  "/",
+			UID:  65534,
+			GID:  65534,
+		},
+		NoNewPrivileges: true,
+	}
+	if err := writeSecureJSON(configPath, config); err != nil {
+		t.Fatalf("writeSecureJSON() error = %v", err)
+	}
+	process, err := startDirectProcess(configPath)
+	if err != nil {
+		t.Fatalf("startDirectProcess() error = %v", err)
+	}
+	state, ok := directProcessIdentity(process.Pid)
+	if !ok || !directProcessMatches(state) {
+		_ = syscall.Kill(-process.Pid, syscall.SIGKILL)
+		_, _ = process.Wait()
+		t.Fatal("direct workload did not expose a stable process identity")
+	}
+	if err := syscall.Kill(-process.Pid, syscall.SIGTERM); err != nil {
+		_ = syscall.Kill(-process.Pid, syscall.SIGKILL)
+		_, _ = process.Wait()
+		t.Fatalf("terminate direct workload: %v", err)
+	}
+	if _, err := process.Wait(); err != nil {
+		t.Fatalf("wait for direct workload: %v", err)
+	}
+	if directProcessMatches(state) {
+		t.Fatal("direct workload remained active after termination")
+	}
+}
+
+func TestBuildOCISpecUsesFullIsolationProfile(t *testing.T) {
+	options := testSpecOptions(IsolationProfile{
+		Name:  FullIsolationProfile,
+		Level: RuntimeLevelFull,
+		Features: IsolationFeatures{
+			UserNamespaces:    true,
+			MountNamespaces:   true,
+			PIDNamespaces:     true,
+			NetworkNamespaces: true,
+			IPCNamespaces:     true,
+			Cgroups:           true,
+			Seccomp:           true,
+			NoNewPrivileges:   true,
+			ReadOnlyRootFS:    true,
+		},
+	})
+	mappings := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 100000, Size: 65536}}
+
+	spec, err := buildOCISpec(
+		options,
+		mappings,
+		mappings,
+		"/runtime/mysterium-test",
+		64*1024*1024,
+	)
+	if err != nil {
+		t.Fatalf("buildOCISpec() error = %v", err)
+	}
+	if !spec.Root.Readonly || spec.Linux.Seccomp == nil || spec.Linux.Resources == nil {
+		t.Fatalf("full profile is missing isolation controls: %#v", spec.Linux)
+	}
+	if spec.Linux.CgroupsPath != "/runtime/mysterium-test" {
+		t.Fatalf("unexpected cgroup path %q", spec.Linux.CgroupsPath)
+	}
+	for _, namespace := range []specs.LinuxNamespaceType{
+		specs.UserNamespace,
+		specs.MountNamespace,
+		specs.PIDNamespace,
+		specs.NetworkNamespace,
+		specs.IPCNamespace,
+	} {
+		if !hasNamespace(spec.Linux.Namespaces, namespace) {
+			t.Errorf("full profile is missing namespace %q", namespace)
+		}
+	}
+}
+
+func testSpecOptions(profile IsolationProfile) Options {
+	return Options{
+		Name:        "runtime.test",
+		ServicePort: 3000,
+		Process: ProcessDefinition{
+			Args: []string{"/bin/server"},
+			Cwd:  "/",
+			UID:  1000,
+			GID:  1000,
+		},
+		ResourceLimits: ResourceLimits{
+			CPU:    "1",
+			Memory: "512MiB",
+			Disk:   "64MiB",
+			Pids:   128,
+		},
+		Isolation: profile,
+	}
+}
+
+func hasNamespace(namespaces []specs.LinuxNamespace, expected specs.LinuxNamespaceType) bool {
+	for _, namespace := range namespaces {
+		if namespace.Type == expected {
+			return true
+		}
+	}
+	return false
 }

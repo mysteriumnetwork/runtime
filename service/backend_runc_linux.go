@@ -71,7 +71,7 @@ const (
 	maxManifestSize       = 64 * 1024
 	maxRootFSSize         = uint64(1024 * 1024 * 1024)
 	maxInstalledServices  = 4
-	metadataSchemaVersion = 1
+	metadataSchemaVersion = 3
 )
 
 var serviceNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
@@ -81,17 +81,19 @@ type persistedServices struct {
 	Services      map[string]Options `json:"services"`
 }
 
-// RuncBackend manages runtime services as OCI bundles and containers via runc.
+// RuncBackend manages OCI-isolated services via runc and explicitly trusted
+// unisolated services via the built-in direct executor. The name is retained
+// to preserve the existing concrete API.
 type RuncBackend struct {
-	mu                sync.Mutex
-	baseDir           string
-	bundlesDir        string
-	metadataPath      string
-	runc              *runc.Runc
-	services          map[string]Options
-	initErr           error
-	available         bool
-	unavailableReason string
+	mu           sync.Mutex
+	baseDir      string
+	bundlesDir   string
+	metadataPath string
+	runc         *runc.Runc
+	services     map[string]Options
+	initErr      error
+	status       RuntimeStatus
+	hostChecks   runtimeHostChecks
 
 	caps         capabilities.RuntimeCapabilities
 	detailedCaps capabilities.DetailedCapabilities
@@ -122,7 +124,12 @@ func newRuncBackend(runtimeDir string) *RuncBackend {
 	}
 
 	backend.initErr = backend.initialize()
-	backend.available, backend.unavailableReason = assessAvailability(backend.caps, backend.initErr)
+	backend.hostChecks = inspectRuntimeHost()
+	if backend.initErr == nil {
+		backend.hostChecks.directExecutorAvailable, backend.hostChecks.directExecutorReason =
+			probeDirectExecutor(backend.baseDir, backend.caps.NoNewPrivileges)
+	}
+	backend.status = assessRuntime(backend.caps, backend.initErr, backend.hostChecks)
 	return backend
 }
 
@@ -160,7 +167,12 @@ func (backend *RuncBackend) initialize() error {
 }
 
 func (backend *RuncBackend) Create(input CreateOptions) error {
-	if err := backend.ensureReady(); err != nil {
+	minimumLevel, err := normalizeMinimumRuntimeLevel(input.MinimumRuntimeLevel)
+	if err != nil {
+		return err
+	}
+	input.MinimumRuntimeLevel = minimumLevel
+	if err := backend.ensureSpawnReady(minimumLevel); err != nil {
 		return err
 	}
 	if err := validateServiceName(input.Name); err != nil {
@@ -176,7 +188,11 @@ func (backend *RuncBackend) Create(input CreateOptions) error {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 
-	if _, active := backend.activeLocked()[input.Name]; active {
+	active, err := backend.activeLocked()
+	if err != nil {
+		return err
+	}
+	if _, active := active[input.Name]; active {
 		return errors.Errorf("runtime service %q is active", input.Name)
 	}
 	if _, updating := backend.services[input.Name]; !updating && len(backend.services) >= maxInstalledServices {
@@ -201,8 +217,10 @@ func (backend *RuncBackend) Create(input CreateOptions) error {
 		return err
 	}
 
-	if err := backend.writeSpec(stagingDir, preparedOptions); err != nil {
-		return err
+	if preparedOptions.Isolation.Level != RuntimeLevelUnisolated {
+		if err := backend.writeSpec(stagingDir, preparedOptions); err != nil {
+			return err
+		}
 	}
 
 	backupDir := filepath.Join(backend.bundlesDir, "."+input.Name+"-previous")
@@ -244,7 +262,7 @@ func (backend *RuncBackend) Create(input CreateOptions) error {
 }
 
 func (backend *RuncBackend) Delete(name string) error {
-	if err := backend.ensureReady(); err != nil {
+	if err := backend.ensureInitialized(); err != nil {
 		return err
 	}
 	if err := validateServiceName(name); err != nil {
@@ -256,7 +274,9 @@ func (backend *RuncBackend) Delete(name string) error {
 
 	options, exists := backend.services[name]
 	if exists {
-		_ = backend.stopContainerLocked(options)
+		if err := backend.stopContainerLocked(options); err != nil {
+			return err
+		}
 	}
 
 	delete(backend.services, name)
@@ -271,7 +291,7 @@ func (backend *RuncBackend) Delete(name string) error {
 }
 
 func (backend *RuncBackend) Start(name string) error {
-	if err := backend.ensureReady(); err != nil {
+	if err := backend.ensureInitialized(); err != nil {
 		return err
 	}
 	if err := validateServiceName(name); err != nil {
@@ -285,15 +305,31 @@ func (backend *RuncBackend) Start(name string) error {
 	if !exists {
 		return errors.Errorf("runtime service %q is not created", name)
 	}
+	if err := backend.ensureSpawnReady(options.MinimumRuntimeLevel); err != nil {
+		return errors.Wrapf(err, "runtime service %q cannot meet its minimum runtime level", name)
+	}
+	if err := backend.ensureProfileSupported(options.Isolation); err != nil {
+		return errors.Wrapf(err, "runtime service %q isolation profile is unavailable", name)
+	}
 
 	bundleDir := backend.bundleDir(name)
 	if !isPathWithinRoot(backend.bundlesDir, bundleDir) {
 		return errors.Errorf("runtime bundle for %q escapes managed directory", name)
 	}
+	if options.Isolation.Level == RuntimeLevelUnisolated {
+		if _, err := os.Stat(filepath.Join(bundleDir, rootfsDirName)); err != nil {
+			return errors.Wrapf(err, "runtime service %q has no validated rootfs", name)
+		}
+		return backend.startDirectLocked(options)
+	}
 	if _, err := os.Stat(filepath.Join(bundleDir, configFileName)); err != nil {
 		return errors.Wrapf(err, "runtime service %q has no validated OCI bundle", name)
 	}
 
+	return backend.startRuncLocked(options, bundleDir)
+}
+
+func (backend *RuncBackend) startRuncLocked(options Options, bundleDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), runcOperationTimeout)
 	defer cancel()
 	state, err := backend.runc.State(ctx, backend.containerID(options.Name))
@@ -314,7 +350,7 @@ func (backend *RuncBackend) Start(name string) error {
 		return backend.wrapRuncError("create", options.Name, err)
 	}
 
-	if backend.caps.NetworkNamespaces {
+	if options.Isolation.Features.NetworkNamespaces {
 		state, stateErr := backend.runc.State(ctx, backend.containerID(options.Name))
 		if stateErr != nil || state == nil || state.Pid <= 0 {
 			_ = backend.forceDelete(options.Name)
@@ -343,7 +379,7 @@ func (backend *RuncBackend) Start(name string) error {
 }
 
 func (backend *RuncBackend) Stop(name string) error {
-	if err := backend.ensureReady(); err != nil {
+	if err := backend.ensureInitialized(); err != nil {
 		return err
 	}
 	if err := validateServiceName(name); err != nil {
@@ -361,7 +397,7 @@ func (backend *RuncBackend) Stop(name string) error {
 
 // DialTCP connects to a TCP listener on loopback inside a running workload.
 func (backend *RuncBackend) DialTCP(name string, port int) (net.Conn, error) {
-	if err := backend.ensureReady(); err != nil {
+	if err := backend.ensureInitialized(); err != nil {
 		return nil, err
 	}
 	if err := validateServiceName(name); err != nil {
@@ -374,6 +410,21 @@ func (backend *RuncBackend) DialTCP(name string, port int) (net.Conn, error) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 
+	options, exists := backend.services[name]
+	if !exists {
+		return nil, errors.Errorf("runtime service %q is not created", name)
+	}
+	if options.Isolation.Level == RuntimeLevelUnisolated {
+		state, err := backend.directStateLocked(name)
+		if err != nil {
+			return nil, err
+		}
+		if state == nil {
+			return nil, errors.Errorf("runtime service %q is not running", name)
+		}
+		return net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), runcOperationTimeout)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), runcOperationTimeout)
 	defer cancel()
 	state, err := backend.runc.State(ctx, backend.containerID(name))
@@ -384,18 +435,24 @@ func (backend *RuncBackend) DialTCP(name string, port int) (net.Conn, error) {
 		return nil, errors.Errorf("runtime service %q is not running", name)
 	}
 
-	return dialTCPInNamespace(state.Pid, port)
+	if options.Isolation.Features.NetworkNamespaces {
+		return dialTCPInNamespace(state.Pid, port)
+	}
+	return net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), runcOperationTimeout)
 }
 
 func (backend *RuncBackend) List() ([]ServiceInfo, error) {
-	if err := backend.ensureReady(); err != nil {
+	if err := backend.ensureInitialized(); err != nil {
 		return nil, err
 	}
 
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 
-	active := backend.activeLocked()
+	active, err := backend.activeLocked()
+	if err != nil {
+		return nil, err
+	}
 	result := make([]ServiceInfo, 0, len(backend.services))
 	for name, options := range backend.services {
 		state := ServiceStatePassive
@@ -416,21 +473,125 @@ func (backend *RuncBackend) Capabilities() (capabilities.RuntimeCapabilities, ca
 	return backend.caps, backend.detailedCaps
 }
 
-func (backend *RuncBackend) Availability() (bool, string) {
-	return backend.available, backend.unavailableReason
+func (backend *RuncBackend) Status() RuntimeStatus {
+	return cloneRuntimeStatus(backend.status)
 }
 
-func (backend *RuncBackend) ensureReady() error {
+func (backend *RuncBackend) Availability() (bool, string) {
+	if backend.status.Level == RuntimeLevelUnavailable {
+		return false, strings.Join(backend.status.BlockingReasons, ", ")
+	}
+	if backend.status.Level == RuntimeLevelUnisolated {
+		return true, "unisolated trusted execution only: " + strings.Join(backend.status.MissingForLimited, ", ")
+	}
+	if backend.status.Level == RuntimeLevelLimited {
+		return true, "limited isolation: " + strings.Join(backend.status.MissingForFull, ", ")
+	}
+	return true, ""
+}
+
+func (backend *RuncBackend) ensureInitialized() error {
 	if backend.initErr != nil {
 		return backend.initErr
 	}
-	if !backend.available {
-		return errors.Errorf("runtime service unavailable: %s", backend.unavailableReason)
+	return nil
+}
+
+func (backend *RuncBackend) ensureSpawnReady(minimum RuntimeLevel) error {
+	if err := backend.ensureInitialized(); err != nil {
+		return err
+	}
+	normalized, err := normalizeMinimumRuntimeLevel(minimum)
+	if err != nil {
+		return err
+	}
+	if backend.status.Level == RuntimeLevelUnavailable {
+		return errors.Errorf(
+			"runtime service unavailable: %s",
+			strings.Join(backend.status.BlockingReasons, ", "),
+		)
+	}
+	if runtimeLevelRank(backend.status.Level) < runtimeLevelRank(normalized) {
+		reasons := backend.status.MissingForLimited
+		if normalized == RuntimeLevelFull {
+			reasons = uniqueSorted(append(
+				append([]string(nil), backend.status.MissingForLimited...),
+				backend.status.MissingForFull...,
+			))
+		}
+		return errors.Errorf(
+			"runtime level %q does not satisfy required minimum %q: %s",
+			backend.status.Level,
+			normalized,
+			strings.Join(reasons, ", "),
+		)
+	}
+	return nil
+}
+
+func (backend *RuncBackend) ensureProfileSupported(profile IsolationProfile) error {
+	if err := validateIsolationProfile(profile); err != nil {
+		return err
+	}
+	if profile.Level == RuntimeLevelUnisolated && !backend.hostChecks.directExecutorAvailable {
+		reason := backend.hostChecks.directExecutorReason
+		if reason == "" {
+			reason = "built-in direct executor is unavailable"
+		}
+		return errors.New(reason)
+	}
+	if runtimeLevelRank(backend.status.Level) < runtimeLevelRank(profile.Level) {
+		return errors.Errorf("runtime level %q is below stored profile level %q", backend.status.Level, profile.Level)
+	}
+	available := backend.status.Profile.Features
+	required := profile.Features
+	var missing []string
+	for _, feature := range []struct {
+		name      string
+		required  bool
+		available bool
+	}{
+		{"filesystem jail", required.FilesystemJail, available.FilesystemJail},
+		{"non-root user", required.NonRootUser, available.NonRootUser},
+		{"capability dropping", required.CapabilitiesDropped, available.CapabilitiesDropped},
+		{"user namespaces", required.UserNamespaces, available.UserNamespaces},
+		{"mount namespaces", required.MountNamespaces, available.MountNamespaces},
+		{"PID namespaces", required.PIDNamespaces, available.PIDNamespaces},
+		{"network namespaces", required.NetworkNamespaces, available.NetworkNamespaces},
+		{"IPC namespaces", required.IPCNamespaces, available.IPCNamespaces},
+		{"cgroup resource isolation", required.Cgroups, available.Cgroups},
+		{"seccomp", required.Seccomp, available.Seccomp},
+		{"no_new_privileges", required.NoNewPrivileges, available.NoNewPrivileges},
+		{"read-only rootfs", required.ReadOnlyRootFS, available.ReadOnlyRootFS},
+	} {
+		if feature.required && !feature.available {
+			missing = append(missing, feature.name)
+		}
+	}
+	if len(missing) > 0 {
+		return errors.Errorf("required features are unavailable: %s", strings.Join(missing, ", "))
+	}
+	if profile.Level != RuntimeLevelUnisolated && !required.UserNamespaces {
+		var missingCapabilities []string
+		for _, bit := range []uint{21, 27} {
+			if !backend.hostChecks.effectiveCapabilities[bit] {
+				missingCapabilities = append(missingCapabilities, effectiveCapabilityName(bit))
+			}
+		}
+		if len(missingCapabilities) > 0 {
+			return errors.Errorf(
+				"rootful profile requires unavailable capabilities: %s",
+				strings.Join(missingCapabilities, ", "),
+			)
+		}
 	}
 	return nil
 }
 
 func (backend *RuncBackend) stopContainerLocked(options Options) error {
+	if options.Isolation.Level == RuntimeLevelUnisolated {
+		return backend.stopDirectLocked(options.Name)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout+5*time.Second)
 	defer cancel()
 	id := backend.containerID(options.Name)
@@ -461,24 +622,37 @@ func (backend *RuncBackend) forceDelete(name string) error {
 	return backend.runc.Delete(ctx, backend.containerID(name), &runc.DeleteOpts{Force: true})
 }
 
-func (backend *RuncBackend) activeLocked() map[string]struct{} {
-	ctx, cancel := context.WithTimeout(context.Background(), runcOperationTimeout)
-	defer cancel()
-	containers, err := backend.runc.List(ctx)
-	if err != nil {
-		return map[string]struct{}{}
+func (backend *RuncBackend) activeLocked() (map[string]struct{}, error) {
+	active := make(map[string]struct{})
+	if backend.hostChecks.runcAvailable {
+		ctx, cancel := context.WithTimeout(context.Background(), runcOperationTimeout)
+		defer cancel()
+		containers, err := backend.runc.List(ctx)
+		if err != nil {
+			return nil, backend.wrapRuncError("list", "", err)
+		}
+		for _, container := range containers {
+			if container == nil {
+				continue
+			}
+			if container.Status == "running" || container.Status == "created" || container.Status == "paused" {
+				active[container.ID] = struct{}{}
+			}
+		}
 	}
-
-	active := make(map[string]struct{}, len(containers))
-	for _, container := range containers {
-		if container == nil {
+	for name, options := range backend.services {
+		if options.Isolation.Level != RuntimeLevelUnisolated {
 			continue
 		}
-		if container.Status == "running" || container.Status == "created" || container.Status == "paused" {
-			active[container.ID] = struct{}{}
+		state, err := backend.directStateLocked(name)
+		if err != nil {
+			return nil, err
+		}
+		if state != nil {
+			active[name] = struct{}{}
 		}
 	}
-	return active
+	return active, nil
 }
 
 func (backend *RuncBackend) prepareBundleLocked(input CreateOptions, bundleDir string) (Options, error) {
@@ -506,7 +680,8 @@ func (backend *RuncBackend) prepareBundleLocked(input CreateOptions, bundleDir s
 	if err != nil {
 		return Options{}, err
 	}
-	uidMappings, gidMappings, err := loadUserMappings()
+	profile := backend.status.Profile
+	uidMappings, gidMappings, err := rootFSOwnershipMappings(profile)
 	if err != nil {
 		return Options{}, err
 	}
@@ -525,11 +700,13 @@ func (backend *RuncBackend) prepareBundleLocked(input CreateOptions, bundleDir s
 	}
 
 	return Options{
-		Name:           input.Name,
-		OCIArtifact:    input.OCIArtifact,
-		ServicePort:    manifest.Service.InternalPort,
-		Process:        process,
-		ResourceLimits: limits,
+		Name:                input.Name,
+		OCIArtifact:         input.OCIArtifact,
+		ServicePort:         manifest.Service.InternalPort,
+		Process:             process,
+		ResourceLimits:      limits,
+		Isolation:           profile,
+		MinimumRuntimeLevel: input.MinimumRuntimeLevel,
 	}, nil
 }
 
@@ -537,7 +714,7 @@ func (backend *RuncBackend) writeSpec(bundleDir string, options Options) error {
 	if len(options.Process.Args) == 0 {
 		return errors.New("OCI image must define Entrypoint or Cmd")
 	}
-	uidMappings, gidMappings, err := loadUserMappings()
+	uidMappings, gidMappings, err := rootFSOwnershipMappings(options.Isolation)
 	if err != nil {
 		return err
 	}
@@ -548,74 +725,16 @@ func (backend *RuncBackend) writeSpec(bundleDir string, options Options) error {
 	if !ok || diskBytes == 0 {
 		return errors.New("manifest disk resource limit is invalid")
 	}
-	errno := uint(unix.EPERM)
-	cgroupPath, err := cgroupPathForService(options.Name)
+	cgroupPath := ""
+	if options.Isolation.Features.Cgroups {
+		cgroupPath, err = cgroupPathForService(options.Name)
+		if err != nil {
+			return err
+		}
+	}
+	spec, err := buildOCISpec(options, uidMappings, gidMappings, cgroupPath, diskBytes)
 	if err != nil {
 		return err
-	}
-	spec := specs.Spec{
-		Version: specs.Version,
-		Process: &specs.Process{
-			Args:            append([]string(nil), options.Process.Args...),
-			Env:             append([]string(nil), options.Process.Env...),
-			Cwd:             options.Process.Cwd,
-			Terminal:        false,
-			NoNewPrivileges: true,
-			User: specs.User{
-				UID: options.Process.UID,
-				GID: options.Process.GID,
-			},
-			Capabilities: &specs.LinuxCapabilities{},
-		},
-		Root: &specs.Root{Path: rootfsDirName, Readonly: true},
-		Mounts: []specs.Mount{
-			{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
-			{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "noexec", "mode=755", "size=65536k"}},
-			{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"}},
-			{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
-			{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=" + strconv.FormatUint(diskBytes, 10)}},
-			{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
-		},
-		Annotations: map[string]string{"mysterium.runtime.service": options.Name},
-		Linux: &specs.Linux{
-			CgroupsPath: cgroupPath,
-			Namespaces: []specs.LinuxNamespace{
-				{Type: specs.PIDNamespace},
-				{Type: specs.NetworkNamespace},
-				{Type: specs.IPCNamespace},
-				{Type: specs.UTSNamespace},
-				{Type: specs.MountNamespace},
-				{Type: specs.UserNamespace},
-			},
-			UIDMappings: uidMappings,
-			GIDMappings: gidMappings,
-			Resources:   buildLinuxResources(options.ResourceLimits),
-			Seccomp: &specs.LinuxSeccomp{
-				DefaultAction: specs.ActAllow,
-				Syscalls: []specs.LinuxSyscall{{
-					Names: []string{
-						"acct", "add_key", "bpf", "clock_adjtime", "create_module",
-						"delete_module", "finit_module", "init_module", "ioperm",
-						"iopl", "keyctl", "kexec_file_load", "kexec_load",
-						"lookup_dcookie", "mount", "move_mount", "name_to_handle_at",
-						"open_by_handle_at", "open_tree", "perf_event_open", "pivot_root",
-						"process_vm_readv", "process_vm_writev", "ptrace", "quotactl",
-						"reboot", "request_key", "setns", "swapoff", "swapon",
-						"sysfs", "umount", "umount2", "unshare", "userfaultfd",
-					},
-					Action:   specs.ActErrno,
-					ErrnoRet: &errno,
-				}},
-			},
-			MaskedPaths: []string{
-				"/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys",
-				"/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats",
-				"/proc/sched_debug", "/sys/firmware",
-			},
-			ReadonlyPaths: []string{
-				"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
-			},
-		},
 	}
 
 	data, err := json.MarshalIndent(spec, "", "  ")
@@ -626,6 +745,106 @@ func (backend *RuncBackend) writeSpec(bundleDir string, options Options) error {
 		return errors.Wrap(err, "failed to write OCI config.json")
 	}
 	return nil
+}
+
+func buildOCISpec(
+	options Options,
+	uidMappings []specs.LinuxIDMapping,
+	gidMappings []specs.LinuxIDMapping,
+	cgroupPath string,
+	diskBytes uint64,
+) (specs.Spec, error) {
+	features := options.Isolation.Features
+	if !features.MountNamespaces || !features.NoNewPrivileges {
+		return specs.Spec{}, errors.New("isolation profile does not meet the minimum execution requirements")
+	}
+
+	namespaces := []specs.LinuxNamespace{
+		{Type: specs.MountNamespace},
+		{Type: specs.UTSNamespace},
+	}
+	if features.PIDNamespaces {
+		namespaces = append(namespaces, specs.LinuxNamespace{Type: specs.PIDNamespace})
+	}
+	if features.NetworkNamespaces {
+		namespaces = append(namespaces, specs.LinuxNamespace{Type: specs.NetworkNamespace})
+	}
+	if features.IPCNamespaces {
+		namespaces = append(namespaces, specs.LinuxNamespace{Type: specs.IPCNamespace})
+	}
+	if features.UserNamespaces {
+		namespaces = append(namespaces, specs.LinuxNamespace{Type: specs.UserNamespace})
+	}
+
+	linux := &specs.Linux{
+		Namespaces: namespaces,
+		MaskedPaths: []string{
+			"/proc/acpi", "/proc/asound", "/proc/kcore", "/proc/keys",
+			"/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats",
+			"/proc/sched_debug", "/sys/firmware",
+		},
+		ReadonlyPaths: []string{
+			"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
+		},
+	}
+	if features.UserNamespaces {
+		linux.UIDMappings = append([]specs.LinuxIDMapping(nil), uidMappings...)
+		linux.GIDMappings = append([]specs.LinuxIDMapping(nil), gidMappings...)
+	}
+	if features.Cgroups {
+		if cgroupPath == "" {
+			return specs.Spec{}, errors.New("cgroup isolation requested without a cgroup path")
+		}
+		linux.CgroupsPath = cgroupPath
+		linux.Resources = buildLinuxResources(options.ResourceLimits)
+	}
+	if features.Seccomp {
+		errno := uint(unix.EPERM)
+		linux.Seccomp = &specs.LinuxSeccomp{
+			DefaultAction: specs.ActAllow,
+			Syscalls: []specs.LinuxSyscall{{
+				Names: []string{
+					"acct", "add_key", "bpf", "clock_adjtime", "create_module",
+					"delete_module", "finit_module", "init_module", "ioperm",
+					"iopl", "keyctl", "kexec_file_load", "kexec_load",
+					"lookup_dcookie", "mount", "move_mount", "name_to_handle_at",
+					"open_by_handle_at", "open_tree", "perf_event_open", "pivot_root",
+					"process_vm_readv", "process_vm_writev", "ptrace", "quotactl",
+					"reboot", "request_key", "setns", "swapoff", "swapon",
+					"sysfs", "umount", "umount2", "unshare", "userfaultfd",
+				},
+				Action:   specs.ActErrno,
+				ErrnoRet: &errno,
+			}},
+		}
+	}
+
+	return specs.Spec{
+		Version: specs.Version,
+		Process: &specs.Process{
+			Args:            append([]string(nil), options.Process.Args...),
+			Env:             append([]string(nil), options.Process.Env...),
+			Cwd:             options.Process.Cwd,
+			Terminal:        false,
+			NoNewPrivileges: features.NoNewPrivileges,
+			User: specs.User{
+				UID: options.Process.UID,
+				GID: options.Process.GID,
+			},
+			Capabilities: &specs.LinuxCapabilities{},
+		},
+		Root: &specs.Root{Path: rootfsDirName, Readonly: features.ReadOnlyRootFS},
+		Mounts: []specs.Mount{
+			{Destination: "/proc", Type: "proc", Source: "proc", Options: []string{"nosuid", "noexec", "nodev"}},
+			{Destination: "/dev", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "noexec", "mode=755", "size=65536k"}},
+			{Destination: "/dev/pts", Type: "devpts", Source: "devpts", Options: []string{"nosuid", "noexec", "newinstance", "ptmxmode=0666", "mode=0620"}},
+			{Destination: "/dev/shm", Type: "tmpfs", Source: "shm", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=65536k"}},
+			{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"nosuid", "noexec", "nodev", "mode=1777", "size=" + strconv.FormatUint(diskBytes, 10)}},
+			{Destination: "/sys", Type: "sysfs", Source: "sysfs", Options: []string{"nosuid", "noexec", "nodev", "ro"}},
+		},
+		Annotations: map[string]string{"mysterium.runtime.service": options.Name},
+		Linux:       linux,
+	}, nil
 }
 
 func (backend *RuncBackend) loadServices() (map[string]Options, error) {
@@ -690,13 +909,69 @@ func validateStoredOptions(options Options) error {
 	if !filepath.IsAbs(options.Process.Cwd) || filepath.Clean(options.Process.Cwd) != options.Process.Cwd {
 		return errors.New("stored OCI working directory is invalid")
 	}
+	if err := validateIsolationProfile(options.Isolation); err != nil {
+		return errors.Wrap(err, "stored isolation profile is invalid")
+	}
+	minimumLevel, err := normalizeMinimumRuntimeLevel(options.MinimumRuntimeLevel)
+	if err != nil || minimumLevel != options.MinimumRuntimeLevel {
+		return errors.New("stored minimum runtime level is invalid")
+	}
+	if runtimeLevelRank(options.Isolation.Level) < runtimeLevelRank(minimumLevel) {
+		return errors.New("stored isolation profile is below the required minimum runtime level")
+	}
 	var manifest Manifest
 	manifest.SchemaVersion = 1
 	manifest.Service.Protocol = "tcp"
 	manifest.Service.InternalPort = options.ServicePort
 	manifest.Resources = options.ResourceLimits
-	_, err := validateManifest(manifest)
+	_, err = validateManifest(manifest)
 	return err
+}
+
+func validateIsolationProfile(profile IsolationProfile) error {
+	if profile.Level != RuntimeLevelUnisolated &&
+		profile.Level != RuntimeLevelLimited &&
+		profile.Level != RuntimeLevelFull {
+		return errors.Errorf("invalid runtime level %q", profile.Level)
+	}
+	if profile.Name != UnisolatedProfile &&
+		profile.Name != BestEffortIsolationProfile &&
+		profile.Name != FullIsolationProfile {
+		return errors.Errorf("unknown profile %q", profile.Name)
+	}
+	if profile.Level == RuntimeLevelFull && profile.Name != FullIsolationProfile {
+		return errors.New("full runtime level requires the full isolation profile")
+	}
+	if profile.Level == RuntimeLevelLimited && profile.Name != BestEffortIsolationProfile {
+		return errors.New("limited runtime level requires the best-effort isolation profile")
+	}
+	if profile.Level == RuntimeLevelUnisolated && profile.Name != UnisolatedProfile {
+		return errors.New("unisolated runtime level requires the unisolated profile")
+	}
+	if !profile.Features.FilesystemJail ||
+		!profile.Features.NonRootUser ||
+		!profile.Features.CapabilitiesDropped {
+		return errors.New("isolation profile is missing mandatory execution safeguards")
+	}
+	if profile.Level == RuntimeLevelUnisolated {
+		features := profile.Features
+		if features.UserNamespaces || features.MountNamespaces || features.PIDNamespaces ||
+			features.NetworkNamespaces || features.IPCNamespaces || features.Cgroups ||
+			features.Seccomp || features.ReadOnlyRootFS {
+			return errors.New("unisolated profile must not claim isolation features")
+		}
+		return nil
+	}
+	if !profile.Features.MountNamespaces {
+		return errors.New("mount namespace is required")
+	}
+	if !profile.Features.NoNewPrivileges {
+		return errors.New("no_new_privileges is required")
+	}
+	if profile.Level == RuntimeLevelFull && !hasFullIsolation(profile.Features) {
+		return errors.New("full profile is missing isolation features")
+	}
+	return nil
 }
 
 func (backend *RuncBackend) bundleDir(name string) string {
@@ -1089,65 +1364,23 @@ func validateServiceName(name string) error {
 	return nil
 }
 
-func assessAvailability(caps capabilities.RuntimeCapabilities, initErr error) (bool, string) {
-	if initErr != nil {
-		return false, initErr.Error()
+func inspectRuntimeHost() runtimeHostChecks {
+	checks := runtimeHostChecks{
+		effectiveCapabilities: make(map[uint]bool, len(runtimeCapabilityRequirements)),
 	}
-	var missing []string
-	if _, err := exec.LookPath(runc.DefaultCommand); err != nil {
-		missing = append(missing, "runc executable")
+	if _, err := exec.LookPath(runc.DefaultCommand); err == nil {
+		checks.runcAvailable = true
 	}
-	requiredCapabilities := []struct {
-		bit  uint
-		name string
-	}{
-		{0, "CAP_CHOWN"},
-		{1, "CAP_DAC_OVERRIDE"},
-		{3, "CAP_FOWNER"},
-		{6, "CAP_SETGID"},
-		{7, "CAP_SETUID"},
-		{12, "CAP_NET_ADMIN"},
-		{18, "CAP_SYS_CHROOT"},
-		{19, "CAP_SYS_PTRACE"},
-		{21, "CAP_SYS_ADMIN"},
-		{27, "CAP_MKNOD"},
+	for _, capability := range runtimeCapabilityRequirements {
+		checks.effectiveCapabilities[capability.bit] = hasEffectiveCapability(capability.bit)
 	}
-	for _, capability := range requiredCapabilities {
-		if !hasEffectiveCapability(capability.bit) {
-			missing = append(missing, capability.name)
-		}
+	if _, _, err := loadUserMappings(); err == nil {
+		checks.userMappingsAvailable = true
 	}
-	required := []struct {
-		name string
-		ok   bool
-	}{
-		{"user namespaces", caps.UserNamespaces},
-		{"subordinate UID/GID mappings", caps.UserNSMappings},
-		{"mount namespaces", caps.MountNamespaces},
-		{"PID namespaces", caps.PIDNamespaces},
-		{"network namespaces", caps.NetworkNamespaces},
-		{"IPC namespaces", caps.IPCNamespaces},
-		{"cgroup v2", caps.CgroupV2},
-		{"writable delegated cgroup tree", caps.WritableCgroupTree},
-		{"seccomp", caps.Seccomp},
-		{"no_new_privileges", caps.NoNewPrivileges},
-		{"read-only rootfs support", caps.ReadOnlyRootFS},
+	if err := requireDelegatedCgroupControllers("cpu", "memory", "pids"); err == nil {
+		checks.cgroupControllersAvailable = true
 	}
-	for _, capability := range required {
-		if !capability.ok {
-			missing = append(missing, capability.name)
-		}
-	}
-	if _, _, err := loadUserMappings(); err != nil {
-		missing = append(missing, err.Error())
-	}
-	if err := requireDelegatedCgroupControllers("cpu", "memory", "pids"); err != nil {
-		missing = append(missing, err.Error())
-	}
-	if len(missing) > 0 {
-		return false, "required isolation unavailable: " + strings.Join(missing, ", ")
-	}
-	return true, ""
+	return checks
 }
 
 func requireDelegatedCgroupControllers(required ...string) error {
@@ -1272,6 +1505,24 @@ func mapContainerID(mappings []specs.LinuxIDMapping, id uint32) (uint32, bool) {
 		return uint32(hostID), true
 	}
 	return 0, false
+}
+
+func rootFSOwnershipMappings(
+	profile IsolationProfile,
+) ([]specs.LinuxIDMapping, []specs.LinuxIDMapping, error) {
+	if profile.Features.UserNamespaces {
+		return loadUserMappings()
+	}
+
+	// Without a user namespace, OCI IDs are host IDs. The maximum uint32 ID
+	// cannot be represented as the end of an OCI mapping and is intentionally
+	// excluded.
+	identity := []specs.LinuxIDMapping{{
+		ContainerID: 0,
+		HostID:      0,
+		Size:        math.MaxUint32,
+	}}
+	return identity, identity, nil
 }
 
 func ensureNoSymlinkParents(root, target string) error {

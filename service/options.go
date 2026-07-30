@@ -14,8 +14,9 @@ import "encoding/json"
 // CreateOptions is the only caller-controlled runtime definition. Everything
 // executable is supplied by the digest-pinned artifact.
 type CreateOptions struct {
-	Name        string `json:"name"`
-	OCIArtifact string `json:"oci_artifact"`
+	Name                string       `json:"name"`
+	OCIArtifact         string       `json:"oci_artifact"`
+	MinimumRuntimeLevel RuntimeLevel `json:"minimum_runtime_level,omitempty"`
 }
 
 // ProcessDefinition is normalized from the OCI image config without passing
@@ -30,11 +31,13 @@ type ProcessDefinition struct {
 
 // Options is an immutable, validated workload definition.
 type Options struct {
-	Name           string            `json:"name"`
-	OCIArtifact    string            `json:"oci_artifact"`
-	ServicePort    int               `json:"service_port"`
-	Process        ProcessDefinition `json:"process"`
-	ResourceLimits ResourceLimits    `json:"resource_limits"`
+	Name                string            `json:"name"`
+	OCIArtifact         string            `json:"oci_artifact"`
+	ServicePort         int               `json:"service_port"`
+	Process             ProcessDefinition `json:"process"`
+	ResourceLimits      ResourceLimits    `json:"resource_limits"`
+	Isolation           IsolationProfile  `json:"isolation"`
+	MinimumRuntimeLevel RuntimeLevel      `json:"minimum_runtime_level"`
 }
 
 type ResourceLimits struct {

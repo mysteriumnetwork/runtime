@@ -19,9 +19,11 @@ package resources
 
 import "github.com/mysteriumnetwork/runtime/capabilities"
 
-// NewResourceLimiter returns the cgroup v2 resource limiter used for runtime
-// workloads. The limiter will fail closed if the host does not provide a
-// writable delegated cgroup tree.
+// NewResourceLimiter returns cgroup v2 isolation when it is available and a
+// best-effort no-op limiter otherwise.
 func NewResourceLimiter(c capabilities.RuntimeCapabilities) ResourceLimiter {
+	if !c.CgroupV2 || !c.WritableCgroupTree {
+		return &NoopLimiter{}
+	}
 	return NewCgroupLimiter()
 }

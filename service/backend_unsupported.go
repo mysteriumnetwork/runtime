@@ -34,23 +34,38 @@ func NewBackend(runtimeDir string) Backend {
 }
 
 func (backend *unsupportedBackend) Create(options CreateOptions) error {
-	return errors.New("runc runtime backend is supported only on linux")
+	return errors.New("runtime execution is supported only on linux")
 }
 
 func (backend *unsupportedBackend) Delete(name string) error {
-	return errors.New("runc runtime backend is supported only on linux")
+	return errors.New("runtime execution is supported only on linux")
 }
 
 func (backend *unsupportedBackend) Start(name string) error {
-	return errors.New("runc runtime backend is supported only on linux")
+	return errors.New("runtime execution is supported only on linux")
 }
 
 func (backend *unsupportedBackend) Stop(name string) error {
-	return errors.New("runc runtime backend is supported only on linux")
+	return errors.New("runtime execution is supported only on linux")
 }
 
 func (backend *unsupportedBackend) Availability() (bool, string) {
-	return false, "runc runtime backend is supported only on linux"
+	return false, "runtime execution is supported only on linux"
+}
+
+func (backend *unsupportedBackend) Status() RuntimeStatus {
+	reason := "runtime execution is supported only on linux"
+	return RuntimeStatus{
+		Level:             RuntimeLevelUnavailable,
+		FullProfile:       FullIsolationProfile,
+		LimitedProfile:    BestEffortIsolationProfile,
+		UnisolatedProfile: UnisolatedProfile,
+		Profile: IsolationProfile{
+			Name:  UnisolatedProfile,
+			Level: RuntimeLevelUnavailable,
+		},
+		BlockingReasons: []string{reason},
+	}
 }
 
 func (backend *unsupportedBackend) DialTCP(name string, port int) (net.Conn, error) {

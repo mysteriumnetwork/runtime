@@ -20,16 +20,69 @@
 package capabilities
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+const (
+	namespaceProbeArgument        = "--mysterium-internal-namespace-probe"
+	namespaceProbeEnvironmentName = "_MYSTERIUM_RUNTIME_NAMESPACE_PROBE"
+	namespaceProbeClone           = "clone"
+	namespaceProbeMountProc       = "mount-proc"
+	namespaceProbeNoPermsExitCode = 77
+	namespaceProbeUnsupportedCode = 78
+	namespaceProbeFailureCode     = 79
+	namespaceProbeTimeout         = 5 * time.Second
+	minimumSubordinateIDRangeSize = 65536
+)
+
+type subordinateIDRange struct {
+	hostID int
+	size   int
+}
+
+// The namespace probe must execute after clone(2), in the child process. Using
+// the current executable keeps detection independent of shell utilities which
+// may not exist in minimal runtime images.
+func init() {
+	if len(os.Args) != 2 ||
+		os.Args[1] != namespaceProbeArgument ||
+		os.Getenv(namespaceProbeEnvironmentName) == "" {
+		return
+	}
+
+	var err error
+	switch os.Getenv(namespaceProbeEnvironmentName) {
+	case namespaceProbeClone:
+	case namespaceProbeMountProc:
+		err = mountProbeProcFS()
+	default:
+		return
+	}
+
+	switch {
+	case err == nil:
+		os.Exit(0)
+	case errors.Is(err, unix.EPERM), errors.Is(err, unix.EACCES), errors.Is(err, unix.EROFS):
+		os.Exit(namespaceProbeNoPermsExitCode)
+	case errors.Is(err, unix.EINVAL), errors.Is(err, unix.ENOSYS),
+		errors.Is(err, unix.ENODEV), errors.Is(err, unix.EOPNOTSUPP):
+		os.Exit(namespaceProbeUnsupportedCode)
+	default:
+		os.Exit(namespaceProbeFailureCode)
+	}
+}
 
 func detectDetailed() DetailedCapabilities {
 	var detailed DetailedCapabilities
@@ -88,7 +141,7 @@ func probeNamespace(nsName, sysctlMaxName string) CapabilityStatus {
 		}
 	}
 
-	return StatusSupported
+	return executeNamespaceProbe(nsName, nil, nil)
 }
 
 func probeUserNSMappings(userNamespaceStatus CapabilityStatus) CapabilityStatus {
@@ -103,26 +156,26 @@ func probeUserNSMappings(userNamespaceStatus CapabilityStatus) CapabilityStatus 
 		gidOwner = currentUser.Username
 	}
 
-	uidStatus := probeSubIDRange("/etc/subuid", uidOwner, strconv.Itoa(os.Geteuid()))
-	gidStatus := probeSubIDRange("/etc/subgid", gidOwner, strconv.Itoa(os.Getegid()))
+	uidRange, uidStatus := findSubIDRange("/etc/subuid", uidOwner, strconv.Itoa(os.Geteuid()))
+	gidRange, gidStatus := findSubIDRange("/etc/subgid", gidOwner, strconv.Itoa(os.Getegid()))
 
 	if uidStatus == StatusNoPerms || gidStatus == StatusNoPerms {
 		return StatusNoPerms
 	}
 	if uidStatus == StatusSupported && gidStatus == StatusSupported {
-		return StatusSupported
+		return executeNamespaceProbe("user", &uidRange, &gidRange)
 	}
 
 	return StatusUnsupported
 }
 
-func probeSubIDRange(filePath, owner, numericOwner string) CapabilityStatus {
+func findSubIDRange(filePath, owner, numericOwner string) (subordinateIDRange, CapabilityStatus) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		if os.IsPermission(err) {
-			return StatusNoPerms
+			return subordinateIDRange{}, StatusNoPerms
 		}
-		return StatusUnsupported
+		return subordinateIDRange{}, StatusUnsupported
 	}
 
 	for _, line := range strings.Split(string(data), "\n") {
@@ -132,7 +185,7 @@ func probeSubIDRange(filePath, owner, numericOwner string) CapabilityStatus {
 		}
 
 		parts := strings.Split(line, ":")
-		if len(parts) < 3 {
+		if len(parts) != 3 {
 			continue
 		}
 
@@ -141,15 +194,149 @@ func probeSubIDRange(filePath, owner, numericOwner string) CapabilityStatus {
 			continue
 		}
 
+		start, err := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 64)
+		if err != nil {
+			continue
+		}
 		count, err := strconv.ParseUint(strings.TrimSpace(parts[2]), 10, 64)
 		if err != nil {
 			continue
 		}
-		if count > 0 {
-			return StatusSupported
+		maxInt := uint64(^uint(0) >> 1)
+		maxID := uint64(^uint32(0))
+		if count < minimumSubordinateIDRangeSize ||
+			start > maxID ||
+			count > maxInt ||
+			count-1 > maxID-start {
+			continue
 		}
+		return subordinateIDRange{hostID: int(start), size: int(count)}, StatusSupported
 	}
 
+	return subordinateIDRange{}, StatusUnsupported
+}
+
+func executeNamespaceProbe(
+	nsName string,
+	uidRange *subordinateIDRange,
+	gidRange *subordinateIDRange,
+) CapabilityStatus {
+	cloneFlags, operation, ok := namespaceProbeConfiguration(nsName)
+	if !ok {
+		return StatusUnsupported
+	}
+
+	systemAttributes := &syscall.SysProcAttr{
+		Cloneflags: cloneFlags,
+		Pdeathsig:  syscall.SIGKILL,
+	}
+	if nsName == "user" {
+		if uidRange == nil {
+			uidRange = &subordinateIDRange{hostID: os.Geteuid(), size: 1}
+		}
+		if gidRange == nil {
+			gidRange = &subordinateIDRange{hostID: os.Getegid(), size: 1}
+		}
+		systemAttributes.UidMappings = []syscall.SysProcIDMap{{
+			ContainerID: 0,
+			HostID:      uidRange.hostID,
+			Size:        uidRange.size,
+		}}
+		systemAttributes.GidMappings = []syscall.SysProcIDMap{{
+			ContainerID: 0,
+			HostID:      gidRange.hostID,
+			Size:        gidRange.size,
+		}}
+		systemAttributes.GidMappingsEnableSetgroups = false
+		systemAttributes.Credential = &syscall.Credential{Uid: 0, Gid: 0}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), namespaceProbeTimeout)
+	defer cancel()
+
+	command := exec.CommandContext(ctx, "/proc/self/exe", namespaceProbeArgument)
+	command.Env = namespaceProbeEnvironment(operation)
+	command.SysProcAttr = systemAttributes
+	err := command.Run()
+	if ctx.Err() != nil {
+		return StatusUnsupported
+	}
+	return classifyNamespaceProbeError(err)
+}
+
+func namespaceProbeConfiguration(nsName string) (uintptr, string, bool) {
+	switch nsName {
+	case "user":
+		// A procfs mount is valid only for a PID namespace owned by the new
+		// user namespace. Clone every namespace requested by the generated
+		// OCI spec so the probe follows the same kernel permission path.
+		return uintptr(
+				unix.CLONE_NEWUSER |
+					unix.CLONE_NEWNS |
+					unix.CLONE_NEWPID |
+					unix.CLONE_NEWNET |
+					unix.CLONE_NEWIPC |
+					unix.CLONE_NEWUTS,
+			),
+			namespaceProbeMountProc, true
+	case "mnt":
+		return uintptr(unix.CLONE_NEWNS), namespaceProbeMountProc, true
+	case "pid":
+		return uintptr(unix.CLONE_NEWPID), namespaceProbeClone, true
+	case "net":
+		return uintptr(unix.CLONE_NEWNET), namespaceProbeClone, true
+	case "ipc":
+		return uintptr(unix.CLONE_NEWIPC), namespaceProbeClone, true
+	default:
+		return 0, "", false
+	}
+}
+
+func namespaceProbeEnvironment(operation string) []string {
+	prefix := namespaceProbeEnvironmentName + "="
+	environment := make([]string, 0, len(os.Environ())+1)
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, prefix) {
+			environment = append(environment, entry)
+		}
+	}
+	return append(environment, prefix+operation)
+}
+
+func mountProbeProcFS() error {
+	if err := unix.Mount("", "/", "", unix.MS_PRIVATE|unix.MS_REC, ""); err != nil {
+		return err
+	}
+	return unix.Mount(
+		"proc",
+		"/proc",
+		"proc",
+		unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV,
+		"",
+	)
+}
+
+func classifyNamespaceProbeError(err error) CapabilityStatus {
+	if err == nil {
+		return StatusSupported
+	}
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EROFS) {
+		return StatusNoPerms
+	}
+	if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOSYS) ||
+		errors.Is(err, unix.ENODEV) || errors.Is(err, unix.EOPNOTSUPP) {
+		return StatusUnsupported
+	}
+
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) {
+		switch exitError.ExitCode() {
+		case namespaceProbeNoPermsExitCode:
+			return StatusNoPerms
+		case namespaceProbeUnsupportedCode:
+			return StatusUnsupported
+		}
+	}
 	return StatusUnsupported
 }
 

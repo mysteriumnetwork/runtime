@@ -1,9 +1,10 @@
-# Runtime Capability Detection and Resource Isolation
+# Runtime Capability Detection and Best-Effort Isolation
 
 This project provides a standalone runtime library for executing approved,
-digest-pinned OCI workloads. Runtime execution is fail-closed: when the host
-cannot provide every required isolation boundary, the runtime reports itself
-unavailable and the node continues without activating runtime services.
+digest-pinned OCI workloads. The runtime applies every isolation mechanism
+available on the host. When OCI isolation cannot be established, an explicit
+trusted-workload policy can use the built-in direct executor instead. A system
+is unavailable only when neither execution path can safely launch a workload.
 
 ## Workload contract
 
@@ -35,8 +36,49 @@ The image root must contain `/mysterium-runtime.json`:
 }
 ```
 
-Only TCP is supported. Missing resource values receive mandatory bounded
-defaults; invalid or excessive values reject the artifact.
+Only TCP is supported. Missing resource values receive bounded defaults;
+invalid or excessive values reject the artifact. CPU, memory, and PID limits
+are enforced when the host provides a writable delegated cgroup v2 tree.
+
+## Runtime levels
+
+The runtime reports a scheduler-facing level together with the exact isolation
+features selected for new workloads:
+
+1. `unavailable`: Neither the OCI executor nor the built-in direct executor can
+   launch a workload. No workload can be spawned.
+2. `unisolated`: The built-in `unisolated-v1` direct executor can launch
+   trusted workloads, but an OCI isolation boundary is unavailable.
+3. `limited`: Workloads can be spawned with a versioned `best-effort-v1`
+   profile, but one or more full isolation guarantees are absent.
+4. `full`: Workloads receive every guarantee in the versioned `full-v1`
+   profile.
+
+Mount namespace isolation, `no_new_privileges`, and the ability to control the
+workload process tree are part of the minimum execution profile. Process-tree
+control may come from a PID namespace or cgroups. User, PID, network, and IPC
+namespaces, cgroup resource controls, seccomp, and a read-only rootfs are
+otherwise applied when available. The selected profile is persisted with each
+installed workload and returned by `list`; a workload is never silently
+retried with weaker isolation at start.
+
+The `unisolated-v1` path does not use `runc`. It starts the image process
+directly after entering the extracted rootfs with `chroot`, selecting the
+image's numeric non-root UID/GID, clearing supplementary groups and Linux
+capabilities, and applying `no_new_privileges` when available. It shares the
+host's mount, PID, network, and IPC namespaces, has no cgroup resource limits,
+seccomp profile, or read-only rootfs, and is not a security boundary. It is
+therefore restricted to digest-pinned workloads that the caller explicitly
+marks as safe. Direct workloads must remain in the foreground; only one direct
+workload may be active at a time.
+
+Creation requires at least `limited` by default. To authorize a trusted
+workload on an `unisolated` device, the caller must explicitly set
+`minimum_runtime_level` to `unisolated`. This policy is persisted and checked
+again at start. Setting it to `limited` or `full` prevents silent downgrade.
+
+The runtime level is a summary for scheduling. Callers should retain the exact
+feature vector because two `limited` devices may provide different guarantees.
 
 ---
 
@@ -75,7 +117,25 @@ go build ./cmd/runtime-cli
 ./runtime-cli -runtime-dir /tmp/myst-runtime -command create -name runtime.test1 -oci-artifact registry.example/workload@sha256:<digest>
 ./runtime-cli -command start -name runtime.test1
 ./runtime-cli -command list
+./runtime-cli -command status
+./runtime-cli -command capabilities
 ```
+
+Explicit trusted direct-execution opt-in:
+
+```bash
+./runtime-cli -runtime-dir /tmp/myst-runtime \
+  -command create \
+  -name runtime.trusted \
+  -oci-artifact registry.example/trusted-workload@sha256:<digest> \
+  -minimum-runtime-level unisolated
+```
+
+`runc` is optional for the `unisolated` profile and remains the execution
+engine for `limited` and `full`. In the current Linux implementation, the
+direct path and rootfs preparation require effective `CHOWN`, `DAC_OVERRIDE`,
+`FOWNER`, `KILL`, `SETGID`, `SETUID`, and `SYS_CHROOT` capabilities; they do not
+require `SYS_ADMIN`, `NET_ADMIN`, or `MKNOD`.
 
 ### Docker demo
 
@@ -112,9 +172,9 @@ supported host for this nested runtime because its VM blocks the subordinate
 user namespace from mounting the workload procfs. The cgroup namespace and cgroup
 filesystem options let the demo wrapper delegate `cpu`, `memory`, and `pids`
 from the container cgroup to sibling workload cgroups managed by nested `runc`.
-The capability list is the exact set currently required by the runtime's
-availability check; the outer Docker seccomp profile is disabled so `runc` can
-install the stricter workload seccomp profile from the generated OCI spec.
+The capability list provides the operational privileges used by the full
+profile; the outer Docker seccomp profile is disabled so `runc` can install the
+stricter workload seccomp profile from the generated OCI spec.
 
 ```bash
 docker run --rm --name mysterium-runtime-demo \
@@ -124,6 +184,7 @@ docker run --rm --name mysterium-runtime-demo \
   --cap-add=CHOWN \
   --cap-add=DAC_OVERRIDE \
   --cap-add=FOWNER \
+  --cap-add=KILL \
   --cap-add=SETGID \
   --cap-add=SETUID \
   --cap-add=NET_ADMIN \
@@ -163,7 +224,7 @@ manifest-defined service port and bridges a local listener through
 The `capabilities` package dynamically inspects the execution environment at startup without relying on heuristics such as checking for `.dockerenv`, parsing `/proc/1/cgroup`, or assuming privileges based on containerization. Instead, it probes actual kernel features:
 
 - **Cgroup v2 & Writable Hierarchy**: Probes `/sys/fs/cgroup/cgroup.controllers` and attempts creating a temporary child cgroup directory to verify if child cgroups and `cgroup.procs` can be created by the current process.
-- **Namespaces**: Probes `/proc/self/ns/<type>` and validates sysctl limits (e.g., `/proc/sys/user/max_user_namespaces` and `/proc/sys/kernel/unprivileged_userns_clone`) to ensure unprivileged cloning is permitted.
+- **Namespaces**: Validates `/proc/self/ns/<type>` and namespace sysctls, then starts short-lived child processes which actually clone each requested namespace. The user-namespace probe clones the complete workload namespace set and mounts a fresh procfs; subordinate UID/GID mappings are verified by repeating that execution probe with the configured `/etc/subuid` and `/etc/subgid` ranges.
 - **Seccomp**: Invokes `prctl(PR_GET_SECCOMP)` directly to test kernel filtering support and validates `/proc/self/status`.
 - **NoNewPrivileges**: Invokes `prctl(PR_GET_NO_NEW_PRIVS)` to verify support for `no_new_privs`.
 
@@ -188,11 +249,11 @@ type ResourceLimiter interface {
 }
 ```
 
-Runtime workloads require a writable delegated cgroup v2 tree. Resource limits
-apply to the entire workload process tree: `cpu.max` controls CPU bandwidth,
+When a writable delegated cgroup v2 tree is available, resource limits apply
+to the entire workload process tree: `cpu.max` controls CPU bandwidth,
 `memory.max` caps memory usage, and `pids.max` limits the number of processes.
-If the required cgroup hierarchy is unavailable, resource isolation fails
-closed.
+Without it, trusted workloads may still run under the limited profile, and the
+runtime reports that cgroup resource isolation is absent.
 
 ---
 
