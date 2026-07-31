@@ -54,13 +54,40 @@ features selected for new workloads:
 4. `full`: Workloads receive every guarantee in the versioned `full-v1`
    profile.
 
-Mount namespace isolation, `no_new_privileges`, and the ability to control the
-workload process tree are part of the minimum execution profile. Process-tree
-control may come from a PID namespace or cgroups. User, PID, network, and IPC
-namespaces, cgroup resource controls, seccomp, and a read-only rootfs are
-otherwise applied when available. The selected profile is persisted with each
+### Current isolation profiles
+
+All runnable profiles jail the process in the extracted image rootfs, run it as
+the image's numeric non-root UID/GID, and start it with an empty Linux
+capability set. The remaining guarantees differ as follows:
+
+| Guarantee | `unisolated-v1` | `best-effort-v1` (`limited`) | `full-v1` |
+| --- | --- | --- | --- |
+| Execution engine | Built-in direct executor | `runc` | `runc` |
+| Private mount and UTS namespaces | No | Yes | Yes |
+| `no_new_privileges` | When available | Required | Required |
+| Workload process-tree control | No isolation from the host process tree | Required through a PID namespace, cgroups, or both | PID namespace and cgroups |
+| User namespace and UID/GID mappings | No | When available | Required |
+| Private network namespace | No | When available | Required |
+| Private IPC namespace | No | When available | Required |
+| Cgroup v2 CPU, memory, and PID limits | No | When available | Required |
+| Seccomp syscall filtering | No | When available | Required |
+| Read-only rootfs | No | When available | Required |
+
+Consequently, a current `limited` profile always has mount isolation,
+`no_new_privileges`, and a way to control the complete workload process tree.
+Compared with `full`, it may be missing a user namespace, PID namespace,
+network namespace, IPC namespace, cgroup resource isolation, seccomp, or a
+read-only rootfs. PID namespaces and cgroups cannot both be missing: without at
+least one of them, the runtime falls back to `unisolated` (when explicitly
+authorized) or becomes unavailable. A limited profile enables each of these
+additional mechanisms that the host can actually support, so `limited` is not
+one fixed set of guarantees.
+
+The selected profile and its exact feature vector are persisted with each
 installed workload and returned by `list`; a workload is never silently
-retried with weaker isolation at start.
+retried with weaker isolation at start. Runtime status also reports
+`missing_for_full`, which names the guarantees preventing the current host from
+selecting `full-v1`.
 
 The `unisolated-v1` path does not use `runc`. It starts the image process
 directly after entering the extracted rootfs with `chroot`, selecting the
