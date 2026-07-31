@@ -20,13 +20,19 @@ import (
 type capabilitiesOutput struct {
 	Capabilities capabilities.RuntimeCapabilities  `json:"capabilities"`
 	Detailed     capabilities.DetailedCapabilities `json:"detailed"`
+	Runtime      service.RuntimeStatus             `json:"runtime"`
 }
 
 func main() {
 	runtimeDir := flag.String("runtime-dir", "/tmp/myst-runtime", "runtime data directory")
-	command := flag.String("command", "", "command: list|capabilities|create|delete|start|stop|proxy")
+	command := flag.String("command", "", "command: list|capabilities|status|create|delete|start|stop|proxy")
 	name := flag.String("name", "", "service name")
 	artifact := flag.String("oci-artifact", "", "OCI artifact reference")
+	minimumRuntimeLevel := flag.String(
+		"minimum-runtime-level",
+		string(service.RuntimeLevelLimited),
+		"minimum runtime level for create: unisolated|limited|full",
+	)
 	listen := flag.String("listen", "127.0.0.1:3000", "TCP listen address for the proxy command")
 	flag.Parse()
 
@@ -38,8 +44,9 @@ func main() {
 	backend := service.NewBackend(*runtimeDir)
 
 	options := service.CreateOptions{
-		Name:        *name,
-		OCIArtifact: *artifact,
+		Name:                *name,
+		OCIArtifact:         *artifact,
+		MinimumRuntimeLevel: service.RuntimeLevel(*minimumRuntimeLevel),
 	}
 
 	var err error
@@ -52,7 +59,13 @@ func main() {
 		}
 	case "capabilities":
 		caps, detailed := backend.Capabilities()
-		printJSON(capabilitiesOutput{Capabilities: caps, Detailed: detailed})
+		printJSON(capabilitiesOutput{
+			Capabilities: caps,
+			Detailed:     detailed,
+			Runtime:      backend.Status(),
+		})
+	case "status":
+		printJSON(backend.Status())
 	case "create":
 		err = backend.Create(options)
 	case "delete":
