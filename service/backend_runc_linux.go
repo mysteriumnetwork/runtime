@@ -383,12 +383,15 @@ func (backend *RuncBackend) startRuncLocked(options Options, bundleDir string) e
 }
 
 func runcCreateOptions(profile IsolationProfile, stdio runc.IO) *runc.CreateOpts {
+	seccompLimited := profile.Level == RuntimeLevelLimited && profile.Features.Seccomp
 	return &runc.CreateOpts{
 		IO: stdio,
-		// A restrictive outer seccomp policy can reject runc's keyring
-		// creation. The limited profile may skip that extra isolation only
-		// when its own seccomp policy blocks all keyring syscalls.
-		NoNewKeyring: profile.Level == RuntimeLevelLimited && profile.Features.Seccomp,
+		// A restrictive outer seccomp policy can reject runc's keyring creation
+		// and pivot_root. The limited profile may use runc's mount-move/chroot
+		// fallback, and may inherit the session keyring only when its own seccomp
+		// policy blocks all keyring syscalls. Full isolation keeps both defaults.
+		NoPivot:      seccompLimited,
+		NoNewKeyring: seccompLimited,
 	}
 }
 
@@ -1410,6 +1413,7 @@ func inspectRuntimeHost() runtimeHostChecks {
 	if err := requireDelegatedCgroupControllers("cpu", "memory", "pids"); err == nil {
 		checks.cgroupControllersAvailable = true
 	}
+	checks.networkNamespaceAccess = canEnterCurrentNetworkNamespace()
 	return checks
 }
 

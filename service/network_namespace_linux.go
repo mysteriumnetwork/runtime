@@ -34,6 +34,13 @@ type namespaceResult struct {
 	err      error
 }
 
+func canEnterCurrentNetworkNamespace() bool {
+	result := runInNetworkNamespace(os.Getpid(), func() (int, error) {
+		return -1, nil
+	})
+	return result.err == nil
+}
+
 func configureLoopback(pid int) error {
 	result := runInNetworkNamespace(pid, func() (int, error) {
 		socketFD, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
@@ -136,7 +143,13 @@ func runInNetworkNamespace(pid int, operation func() (int, error)) namespaceResu
 		targetFD, err := unix.Open(targetPath, unix.O_RDONLY|unix.O_CLOEXEC, 0)
 		if err != nil {
 			runtime.UnlockOSThread()
-			resultChannel <- namespaceResult{socketFD: -1, err: errors.Wrap(err, "failed to open workload network namespace")}
+			resultChannel <- namespaceResult{
+				socketFD: -1,
+				err: errors.Wrap(
+					err,
+					"failed to open workload network namespace (requires CAP_SYS_PTRACE and outer /proc access)",
+				),
+			}
 			return
 		}
 		defer unix.Close(targetFD)

@@ -50,6 +50,40 @@ func TestAssessRuntimeLimitedWhenOptionalIsolationIsMissing(t *testing.T) {
 	}
 }
 
+func TestAssessRuntimeOmitsNetworkNamespaceWithoutSysPtrace(t *testing.T) {
+	host := fullRuntimeHostChecks()
+	host.effectiveCapabilities[19] = false
+
+	status := assessRuntime(fullRuntimeCapabilities(), nil, host)
+
+	if status.Level != RuntimeLevelLimited {
+		t.Fatalf("runtime level = %q, want %q: %#v", status.Level, RuntimeLevelLimited, status)
+	}
+	if status.Profile.Features.NetworkNamespaces {
+		t.Fatal("limited profile enabled an unmanageable network namespace")
+	}
+	if !slices.Contains(status.MissingForFull, "network namespaces") {
+		t.Fatalf("missing_for_full does not report network namespaces: %#v", status.MissingForFull)
+	}
+}
+
+func TestAssessRuntimeOmitsNetworkNamespaceWhenSetnsIsBlocked(t *testing.T) {
+	host := fullRuntimeHostChecks()
+	host.networkNamespaceAccess = false
+
+	status := assessRuntime(fullRuntimeCapabilities(), nil, host)
+
+	if status.Level != RuntimeLevelLimited {
+		t.Fatalf("runtime level = %q, want %q: %#v", status.Level, RuntimeLevelLimited, status)
+	}
+	if status.Profile.Features.NetworkNamespaces {
+		t.Fatal("limited profile enabled a network namespace when setns is blocked")
+	}
+	if !slices.Contains(status.MissingForFull, "network namespaces") {
+		t.Fatalf("missing_for_full does not report network namespaces: %#v", status.MissingForFull)
+	}
+}
+
 func TestAssessRuntimeUnisolatedWhenIsolationFloorIsMissing(t *testing.T) {
 	caps := fullRuntimeCapabilities()
 	caps.MountNamespaces = false
@@ -184,5 +218,6 @@ func fullRuntimeHostChecks() runtimeHostChecks {
 		effectiveCapabilities:      effective,
 		userMappingsAvailable:      true,
 		cgroupControllersAvailable: true,
+		networkNamespaceAccess:     true,
 	}
 }

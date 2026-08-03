@@ -256,25 +256,25 @@ func TestRuncForProfilePreservesCgroupManagerWithCgroups(t *testing.T) {
 	}
 }
 
-func TestRuncCreateOptionsSkipsNewKeyringForSeccompLimitedProfile(t *testing.T) {
+func TestRuncCreateOptionsUseSeccompLimitedCompatibilityFallbacks(t *testing.T) {
 	profile := IsolationProfile{
 		Level:    RuntimeLevelLimited,
 		Features: IsolationFeatures{Seccomp: true},
 	}
 
-	if opts := runcCreateOptions(profile, nil); !opts.NoNewKeyring {
-		t.Fatal("seccomp-enabled limited profile did not skip runc keyring creation")
+	if opts := runcCreateOptions(profile, nil); !opts.NoNewKeyring || !opts.NoPivot {
+		t.Fatalf("seccomp-enabled limited profile did not enable runc compatibility fallbacks: %#v", opts)
 	}
 }
 
-func TestRuncCreateOptionsKeepsNewKeyringWithoutWorkloadSeccomp(t *testing.T) {
+func TestRuncCreateOptionsKeepFullRuncIsolationDefaults(t *testing.T) {
 	profiles := []IsolationProfile{
 		{Level: RuntimeLevelLimited},
 		{Level: RuntimeLevelFull, Features: IsolationFeatures{Seccomp: true}},
 	}
 	for _, profile := range profiles {
-		if opts := runcCreateOptions(profile, nil); opts.NoNewKeyring {
-			t.Fatalf("profile level %q with seccomp=%t unexpectedly skipped runc keyring creation",
+		if opts := runcCreateOptions(profile, nil); opts.NoNewKeyring || opts.NoPivot {
+			t.Fatalf("profile level %q with seccomp=%t unexpectedly weakened runc isolation defaults",
 				profile.Level, profile.Features.Seccomp)
 		}
 	}
