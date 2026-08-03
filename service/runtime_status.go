@@ -14,6 +14,7 @@ type runtimeHostChecks struct {
 	effectiveCapabilities      map[uint]bool
 	userMappingsAvailable      bool
 	cgroupControllersAvailable bool
+	networkNamespaceAccess     bool
 }
 
 var runtimeCapabilityRequirements = []struct {
@@ -28,6 +29,7 @@ var runtimeCapabilityRequirements = []struct {
 	{7, "CAP_SETUID"},
 	{12, "CAP_NET_ADMIN"},
 	{18, "CAP_SYS_CHROOT"},
+	{19, "CAP_SYS_PTRACE"},
 	{21, "CAP_SYS_ADMIN"},
 	{27, "CAP_MKNOD"},
 }
@@ -44,10 +46,13 @@ func assessRuntime(
 		UserNamespaces: caps.UserNamespaces &&
 			caps.UserNSMappings &&
 			host.userMappingsAvailable,
-		MountNamespaces:   caps.MountNamespaces,
-		PIDNamespaces:     caps.PIDNamespaces,
-		NetworkNamespaces: caps.NetworkNamespaces && host.effectiveCapabilities[12],
-		IPCNamespaces:     caps.IPCNamespaces,
+		MountNamespaces: caps.MountNamespaces,
+		PIDNamespaces:   caps.PIDNamespaces,
+		NetworkNamespaces: caps.NetworkNamespaces &&
+			host.effectiveCapabilities[12] &&
+			host.effectiveCapabilities[19] &&
+			host.networkNamespaceAccess,
+		IPCNamespaces: caps.IPCNamespaces,
 		Cgroups: caps.CgroupV2 &&
 			caps.WritableCgroupTree &&
 			host.cgroupControllersAvailable,

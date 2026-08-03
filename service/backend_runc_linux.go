@@ -332,50 +332,67 @@ func (backend *RuncBackend) Start(name string) error {
 func (backend *RuncBackend) startRuncLocked(options Options, bundleDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), runcOperationTimeout)
 	defer cancel()
-	state, err := backend.runc.State(ctx, backend.containerID(options.Name))
+	runner := backend.runcForProfile(options.Isolation)
+	state, err := runner.State(ctx, backend.containerID(options.Name))
 	if err == nil && state != nil && state.Status != "stopped" {
 		return nil
 	}
 
-	_ = backend.runc.Delete(ctx, backend.containerID(options.Name), &runc.DeleteOpts{Force: true})
+	_ = runner.Delete(ctx, backend.containerID(options.Name), &runc.DeleteOpts{Force: true})
 
 	stdio, err := runc.NewNullIO()
 	if err != nil {
 		return errors.Wrap(err, "failed to create null io")
 	}
 
-	if err := backend.runc.Create(ctx, backend.containerID(options.Name), bundleDir, &runc.CreateOpts{
-		IO: stdio,
-	}); err != nil {
+	if err := runner.Create(
+		ctx,
+		backend.containerID(options.Name),
+		bundleDir,
+		runcCreateOptions(options.Isolation, stdio),
+	); err != nil {
 		return backend.wrapRuncError("create", options.Name, err)
 	}
 
 	if options.Isolation.Features.NetworkNamespaces {
-		state, stateErr := backend.runc.State(ctx, backend.containerID(options.Name))
+		state, stateErr := runner.State(ctx, backend.containerID(options.Name))
 		if stateErr != nil || state == nil || state.Pid <= 0 {
-			_ = backend.forceDelete(options.Name)
+			_ = backend.forceDelete(runner, options.Name)
 			if stateErr != nil {
 				return errors.Wrapf(stateErr, "failed to inspect created runtime service %q", options.Name)
 			}
 			return errors.Errorf("created runtime service %q has no process", options.Name)
 		}
 		if err := configureLoopback(state.Pid); err != nil {
-			_ = backend.forceDelete(options.Name)
+			_ = backend.forceDelete(runner, options.Name)
 			return errors.Wrapf(err, "failed to configure network namespace for %q", options.Name)
 		}
 	}
 
-	if err := backend.runc.Start(ctx, backend.containerID(options.Name)); err != nil {
-		_ = backend.forceDelete(options.Name)
+	if err := runner.Start(ctx, backend.containerID(options.Name)); err != nil {
+		_ = backend.forceDelete(runner, options.Name)
 		return backend.wrapRuncError("start", options.Name, err)
 	}
 
-	if state, err := backend.runc.State(ctx, backend.containerID(options.Name)); err != nil || state == nil || state.Pid <= 0 {
+	if state, err := runner.State(ctx, backend.containerID(options.Name)); err != nil || state == nil || state.Pid <= 0 {
 		_ = backend.stopContainerLocked(options)
 		return errors.Errorf("started runtime service %q has no process", options.Name)
 	}
 
 	return nil
+}
+
+func runcCreateOptions(profile IsolationProfile, stdio runc.IO) *runc.CreateOpts {
+	seccompLimited := profile.Level == RuntimeLevelLimited && profile.Features.Seccomp
+	return &runc.CreateOpts{
+		IO: stdio,
+		// A restrictive outer seccomp policy can reject runc's keyring creation
+		// and pivot_root. The limited profile may use runc's mount-move/chroot
+		// fallback, and may inherit the session keyring only when its own seccomp
+		// policy blocks all keyring syscalls. Full isolation keeps both defaults.
+		NoPivot:      seccompLimited,
+		NoNewKeyring: seccompLimited,
+	}
 }
 
 func (backend *RuncBackend) Stop(name string) error {
@@ -427,7 +444,7 @@ func (backend *RuncBackend) DialTCP(name string, port int) (net.Conn, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), runcOperationTimeout)
 	defer cancel()
-	state, err := backend.runc.State(ctx, backend.containerID(name))
+	state, err := backend.runcForProfile(options.Isolation).State(ctx, backend.containerID(name))
 	if err != nil {
 		return nil, backend.wrapRuncError("inspect", name, err)
 	}
@@ -595,13 +612,14 @@ func (backend *RuncBackend) stopContainerLocked(options Options) error {
 	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout+5*time.Second)
 	defer cancel()
 	id := backend.containerID(options.Name)
+	runner := backend.runcForProfile(options.Isolation)
 
-	state, err := backend.runc.State(ctx, id)
+	state, err := runner.State(ctx, id)
 	if err == nil && state != nil && state.Status != "stopped" {
-		_ = backend.runc.Kill(ctx, id, int(syscall.SIGTERM), &runc.KillOpts{All: true})
+		_ = runner.Kill(ctx, id, int(syscall.SIGTERM), &runc.KillOpts{All: true})
 		deadline := time.Now().Add(stopTimeout)
 		for time.Now().Before(deadline) {
-			state, err = backend.runc.State(ctx, id)
+			state, err = runner.State(ctx, id)
 			if err != nil || state == nil || state.Status == "stopped" {
 				break
 			}
@@ -609,17 +627,32 @@ func (backend *RuncBackend) stopContainerLocked(options Options) error {
 		}
 	}
 
-	if err := backend.forceDelete(options.Name); err != nil && !isContainerMissingError(err) {
+	if err := backend.forceDelete(runner, options.Name); err != nil && !isContainerMissingError(err) {
 		return errors.Wrapf(err, "failed to delete runc container %q", options.Name)
 	}
 
 	return nil
 }
 
-func (backend *RuncBackend) forceDelete(name string) error {
+func (backend *RuncBackend) forceDelete(runner *runc.Runc, name string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return backend.runc.Delete(ctx, backend.containerID(name), &runc.DeleteOpts{Force: true})
+	return runner.Delete(ctx, backend.containerID(name), &runc.DeleteOpts{Force: true})
+}
+
+// runcForProfile selects runc's rootless cgroup manager when cgroup isolation
+// is absent. Without this explicit mode, rootful runc assigns the container ID
+// as a default cgroup path even when the OCI spec omits cgroupsPath and
+// resources, then fails on a read-only or non-delegated cgroup hierarchy.
+func (backend *RuncBackend) runcForProfile(profile IsolationProfile) *runc.Runc {
+	if profile.Features.Cgroups {
+		return backend.runc
+	}
+
+	runner := *backend.runc
+	rootlessCgroups := true
+	runner.Rootless = &rootlessCgroups
+	return &runner
 }
 
 func (backend *RuncBackend) activeLocked() (map[string]struct{}, error) {
@@ -1380,6 +1413,7 @@ func inspectRuntimeHost() runtimeHostChecks {
 	if err := requireDelegatedCgroupControllers("cpu", "memory", "pids"); err == nil {
 		checks.cgroupControllersAvailable = true
 	}
+	checks.networkNamespaceAccess = canEnterCurrentNetworkNamespace()
 	return checks
 }
 

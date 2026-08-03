@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"testing"
 
+	runc "github.com/containerd/go-runc"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
@@ -226,6 +227,56 @@ func TestCgroupPathForServiceRejectsRelativeParent(t *testing.T) {
 
 	if _, err := cgroupPathForService("service.alpha"); err == nil {
 		t.Fatal("expected relative delegated cgroup parent to be rejected")
+	}
+}
+
+func TestRuncForProfileUsesRootlessCgroupManagerWithoutCgroups(t *testing.T) {
+	base := &runc.Runc{}
+	backend := &RuncBackend{runc: base}
+
+	runner := backend.runcForProfile(IsolationProfile{})
+	if runner == base {
+		t.Fatal("cgroup-less profile mutated the shared runc client")
+	}
+	if runner.Rootless == nil || !*runner.Rootless {
+		t.Fatal("cgroup-less profile did not enable runc's rootless cgroup manager")
+	}
+	if base.Rootless != nil {
+		t.Fatal("cgroup-less profile changed the shared runc client")
+	}
+}
+
+func TestRuncForProfilePreservesCgroupManagerWithCgroups(t *testing.T) {
+	base := &runc.Runc{}
+	backend := &RuncBackend{runc: base}
+	profile := IsolationProfile{Features: IsolationFeatures{Cgroups: true}}
+
+	if runner := backend.runcForProfile(profile); runner != base {
+		t.Fatal("cgroup-enabled profile did not preserve the shared runc client")
+	}
+}
+
+func TestRuncCreateOptionsUseSeccompLimitedCompatibilityFallbacks(t *testing.T) {
+	profile := IsolationProfile{
+		Level:    RuntimeLevelLimited,
+		Features: IsolationFeatures{Seccomp: true},
+	}
+
+	if opts := runcCreateOptions(profile, nil); !opts.NoNewKeyring || !opts.NoPivot {
+		t.Fatalf("seccomp-enabled limited profile did not enable runc compatibility fallbacks: %#v", opts)
+	}
+}
+
+func TestRuncCreateOptionsKeepFullRuncIsolationDefaults(t *testing.T) {
+	profiles := []IsolationProfile{
+		{Level: RuntimeLevelLimited},
+		{Level: RuntimeLevelFull, Features: IsolationFeatures{Seccomp: true}},
+	}
+	for _, profile := range profiles {
+		if opts := runcCreateOptions(profile, nil); opts.NoNewKeyring || opts.NoPivot {
+			t.Fatalf("profile level %q with seccomp=%t unexpectedly weakened runc isolation defaults",
+				profile.Level, profile.Features.Seccomp)
+		}
 	}
 }
 
