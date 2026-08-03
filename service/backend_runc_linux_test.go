@@ -256,6 +256,30 @@ func TestRuncForProfilePreservesCgroupManagerWithCgroups(t *testing.T) {
 	}
 }
 
+func TestRuncCreateOptionsSkipsNewKeyringForSeccompLimitedProfile(t *testing.T) {
+	profile := IsolationProfile{
+		Level:    RuntimeLevelLimited,
+		Features: IsolationFeatures{Seccomp: true},
+	}
+
+	if opts := runcCreateOptions(profile, nil); !opts.NoNewKeyring {
+		t.Fatal("seccomp-enabled limited profile did not skip runc keyring creation")
+	}
+}
+
+func TestRuncCreateOptionsKeepsNewKeyringWithoutWorkloadSeccomp(t *testing.T) {
+	profiles := []IsolationProfile{
+		{Level: RuntimeLevelLimited},
+		{Level: RuntimeLevelFull, Features: IsolationFeatures{Seccomp: true}},
+	}
+	for _, profile := range profiles {
+		if opts := runcCreateOptions(profile, nil); opts.NoNewKeyring {
+			t.Fatalf("profile level %q with seccomp=%t unexpectedly skipped runc keyring creation",
+				profile.Level, profile.Features.Seccomp)
+		}
+	}
+}
+
 func TestMapContainerID(t *testing.T) {
 	mappings := []specs.LinuxIDMapping{{ContainerID: 0, HostID: 100000, Size: 65536}}
 

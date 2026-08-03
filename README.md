@@ -71,14 +71,18 @@ capability set. The remaining guarantees differ as follows:
 | Private IPC namespace | No | When available | Required |
 | Cgroup v2 CPU, memory, and PID limits | No | When available | Required |
 | Seccomp syscall filtering | No | When available | Required |
+| Private session keyring | No | With seccomp unavailable; otherwise keyring syscalls are blocked | Required |
 | Read-only rootfs | No | When available | Required |
 
 Consequently, a current `limited` profile always has mount isolation,
 `no_new_privileges`, and a way to control the complete workload process tree.
 Compared with `full`, it may be missing a user namespace, PID namespace,
 network namespace, IPC namespace, cgroup resource isolation, seccomp, or a
-read-only rootfs. PID namespaces and cgroups cannot both be missing: without at
-least one of them, the runtime falls back to `unisolated` (when explicitly
+read-only rootfs. When seccomp is enabled for a limited workload, runc skips
+creating a private session keyring so that restrictive outer seccomp policies
+cannot prevent startup; the workload seccomp policy denies `add_key`, `keyctl`,
+and `request_key`. PID namespaces and cgroups cannot both be missing: without
+at least one of them, the runtime falls back to `unisolated` (when explicitly
 authorized) or becomes unavailable. A limited profile enables each of these
 additional mechanisms that the host can actually support, so `limited` is not
 one fixed set of guarantees.

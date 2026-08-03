@@ -345,9 +345,12 @@ func (backend *RuncBackend) startRuncLocked(options Options, bundleDir string) e
 		return errors.Wrap(err, "failed to create null io")
 	}
 
-	if err := runner.Create(ctx, backend.containerID(options.Name), bundleDir, &runc.CreateOpts{
-		IO: stdio,
-	}); err != nil {
+	if err := runner.Create(
+		ctx,
+		backend.containerID(options.Name),
+		bundleDir,
+		runcCreateOptions(options.Isolation, stdio),
+	); err != nil {
 		return backend.wrapRuncError("create", options.Name, err)
 	}
 
@@ -377,6 +380,16 @@ func (backend *RuncBackend) startRuncLocked(options Options, bundleDir string) e
 	}
 
 	return nil
+}
+
+func runcCreateOptions(profile IsolationProfile, stdio runc.IO) *runc.CreateOpts {
+	return &runc.CreateOpts{
+		IO: stdio,
+		// A restrictive outer seccomp policy can reject runc's keyring
+		// creation. The limited profile may skip that extra isolation only
+		// when its own seccomp policy blocks all keyring syscalls.
+		NoNewKeyring: profile.Level == RuntimeLevelLimited && profile.Features.Seccomp,
+	}
 }
 
 func (backend *RuncBackend) Stop(name string) error {
