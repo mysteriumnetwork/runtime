@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
 
+: "${MYSTERIUM_SERVICE_BIND_ADDRESS:?runtime did not provide a service bind address}"
+: "${MYSTERIUM_SERVICE_PORT:?runtime did not provide a service port}"
+
 while true; do
     {
         printf 'HTTP/1.1 200 OK\r\n'
@@ -8,5 +11,5 @@ while true; do
         printf 'Connection: close\r\n'
         printf '\r\n'
         cat /response.txt
-    } | nc -l -p 3000
+    } | nc -l -s "$MYSTERIUM_SERVICE_BIND_ADDRESS" -p "$MYSTERIUM_SERVICE_PORT"
 done

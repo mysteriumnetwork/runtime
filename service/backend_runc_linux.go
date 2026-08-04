@@ -27,6 +27,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/user"
@@ -63,6 +64,9 @@ const (
 	rootfsDirName         = "rootfs"
 	manifestFileName      = "mysterium-runtime.json"
 	cgroupParentEnv       = "MYSTERIUM_CGROUP_PARENT"
+	serviceBindAddressEnv = "MYSTERIUM_SERVICE_BIND_ADDRESS"
+	servicePortEnv        = "MYSTERIUM_SERVICE_PORT"
+	serviceLoopback       = "127.0.0.1"
 	defaultCPUPeriod      = uint64(100000)
 	stopTimeout           = 5 * time.Second
 	runcOperationTimeout  = 30 * time.Second
@@ -75,6 +79,7 @@ const (
 )
 
 var serviceNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
+var serviceBindAddressPool = netip.MustParsePrefix("127.64.0.0/10")
 
 type persistedServices struct {
 	SchemaVersion int                `json:"schema_version"`
@@ -216,6 +221,9 @@ func (backend *RuncBackend) Create(input CreateOptions) error {
 	if err != nil {
 		return err
 	}
+	if err := backend.assignServiceBindAddressLocked(&preparedOptions); err != nil {
+		return err
+	}
 
 	if preparedOptions.Isolation.Level != RuntimeLevelUnisolated {
 		if err := backend.writeSpec(stagingDir, preparedOptions); err != nil {
@@ -281,6 +289,9 @@ func (backend *RuncBackend) Delete(name string) error {
 
 	delete(backend.services, name)
 	if err := backend.persistLocked(); err != nil {
+		if exists {
+			backend.services[name] = options
+		}
 		return err
 	}
 
@@ -439,7 +450,7 @@ func (backend *RuncBackend) DialTCP(name string, port int) (net.Conn, error) {
 		if state == nil {
 			return nil, errors.Errorf("runtime service %q is not running", name)
 		}
-		return net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), runcOperationTimeout)
+		return dialRunningService(options, 0, port, net.DialTimeout, dialTCPInNamespace)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), runcOperationTimeout)
@@ -452,10 +463,27 @@ func (backend *RuncBackend) DialTCP(name string, port int) (net.Conn, error) {
 		return nil, errors.Errorf("runtime service %q is not running", name)
 	}
 
+	return dialRunningService(options, state.Pid, port, net.DialTimeout, dialTCPInNamespace)
+}
+
+type hostTCPDialFunc func(network, address string, timeout time.Duration) (net.Conn, error)
+type namespaceTCPDialFunc func(pid, port int) (net.Conn, error)
+
+func dialRunningService(
+	options Options,
+	pid int,
+	port int,
+	hostDial hostTCPDialFunc,
+	namespaceDial namespaceTCPDialFunc,
+) (net.Conn, error) {
 	if options.Isolation.Features.NetworkNamespaces {
-		return dialTCPInNamespace(state.Pid, port)
+		return namespaceDial(pid, port)
 	}
-	return net.DialTimeout("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), runcOperationTimeout)
+	return hostDial(
+		"tcp4",
+		net.JoinHostPort(options.ServiceBindAddress, strconv.Itoa(port)),
+		runcOperationTimeout,
+	)
 }
 
 func (backend *RuncBackend) List() ([]ServiceInfo, error) {
@@ -743,6 +771,40 @@ func (backend *RuncBackend) prepareBundleLocked(input CreateOptions, bundleDir s
 	}, nil
 }
 
+func (backend *RuncBackend) assignServiceBindAddressLocked(options *Options) error {
+	if options.Isolation.Features.NetworkNamespaces {
+		options.ServiceBindAddress = serviceLoopback
+		return nil
+	}
+
+	if existing, ok := backend.services[options.Name]; ok {
+		address, err := validateHostServiceBindAddress(existing.ServiceBindAddress)
+		if err == nil {
+			options.ServiceBindAddress = address.String()
+			return nil
+		}
+	}
+
+	used := make(map[netip.Addr]string)
+	for name, existing := range backend.services {
+		if name == options.Name || existing.Isolation.Features.NetworkNamespaces {
+			continue
+		}
+		address, err := validateHostServiceBindAddress(existing.ServiceBindAddress)
+		if err != nil {
+			return errors.Wrapf(err, "invalid assigned service bind address for %q", name)
+		}
+		used[address] = name
+	}
+	for candidate := serviceBindAddressPool.Addr().Next(); serviceBindAddressPool.Contains(candidate); candidate = candidate.Next() {
+		if _, allocated := used[candidate]; !allocated {
+			options.ServiceBindAddress = candidate.String()
+			return nil
+		}
+	}
+	return errors.Errorf("runtime service bind address pool %s is exhausted", serviceBindAddressPool)
+}
+
 func (backend *RuncBackend) writeSpec(bundleDir string, options Options) error {
 	if len(options.Process.Args) == 0 {
 		return errors.New("OCI image must define Entrypoint or Cmd")
@@ -856,7 +918,7 @@ func buildOCISpec(
 		Version: specs.Version,
 		Process: &specs.Process{
 			Args:            append([]string(nil), options.Process.Args...),
-			Env:             append([]string(nil), options.Process.Env...),
+			Env:             processEnvironment(options),
 			Cwd:             options.Process.Cwd,
 			Terminal:        false,
 			NoNewPrivileges: features.NoNewPrivileges,
@@ -902,6 +964,7 @@ func (backend *RuncBackend) loadServices() (map[string]Options, error) {
 	if persisted.Services == nil {
 		persisted.Services = make(map[string]Options)
 	}
+	assigned := make(map[netip.Addr]string)
 	for name, options := range persisted.Services {
 		if name != options.Name {
 			return nil, errors.Errorf("runtime metadata key %q does not match definition name %q", name, options.Name)
@@ -909,6 +972,17 @@ func (backend *RuncBackend) loadServices() (map[string]Options, error) {
 		if err := validateStoredOptions(options); err != nil {
 			return nil, errors.Wrapf(err, "invalid stored runtime definition %q", name)
 		}
+		if options.Isolation.Features.NetworkNamespaces {
+			continue
+		}
+		address, _ := netip.ParseAddr(options.ServiceBindAddress)
+		if other, duplicate := assigned[address]; duplicate {
+			return nil, errors.Errorf(
+				"runtime definitions %q and %q have duplicate service bind address %s",
+				other, name, address,
+			)
+		}
+		assigned[address] = name
 	}
 	return persisted.Services, nil
 }
@@ -942,6 +1016,9 @@ func validateStoredOptions(options Options) error {
 	if !filepath.IsAbs(options.Process.Cwd) || filepath.Clean(options.Process.Cwd) != options.Process.Cwd {
 		return errors.New("stored OCI working directory is invalid")
 	}
+	if err := validateReservedEnvironment(options.Process.Env); err != nil {
+		return err
+	}
 	if err := validateIsolationProfile(options.Isolation); err != nil {
 		return errors.Wrap(err, "stored isolation profile is invalid")
 	}
@@ -952,6 +1029,13 @@ func validateStoredOptions(options Options) error {
 	if runtimeLevelRank(options.Isolation.Level) < runtimeLevelRank(minimumLevel) {
 		return errors.New("stored isolation profile is below the required minimum runtime level")
 	}
+	if options.Isolation.Features.NetworkNamespaces {
+		if options.ServiceBindAddress != serviceLoopback {
+			return errors.Errorf("network-namespace service bind address must be %s", serviceLoopback)
+		}
+	} else if _, err := validateHostServiceBindAddress(options.ServiceBindAddress); err != nil {
+		return err
+	}
 	var manifest Manifest
 	manifest.SchemaVersion = 1
 	manifest.Service.Protocol = "tcp"
@@ -959,6 +1043,39 @@ func validateStoredOptions(options Options) error {
 	manifest.Resources = options.ResourceLimits
 	_, err = validateManifest(manifest)
 	return err
+}
+
+func validateHostServiceBindAddress(value string) (netip.Addr, error) {
+	address, err := netip.ParseAddr(value)
+	if err != nil || !address.Is4() || !serviceBindAddressPool.Contains(address) || address == serviceBindAddressPool.Addr() {
+		return netip.Addr{}, errors.Errorf(
+			"host-network service bind address %q is outside managed pool %s",
+			value, serviceBindAddressPool,
+		)
+	}
+	return address, nil
+}
+
+func processEnvironment(options Options) []string {
+	environment := append([]string(nil), options.Process.Env...)
+	environment = append(environment,
+		serviceBindAddressEnv+"="+options.ServiceBindAddress,
+		servicePortEnv+"="+strconv.Itoa(options.ServicePort),
+	)
+	return environment
+}
+
+func validateReservedEnvironment(environment []string) error {
+	for _, entry := range environment {
+		name := entry
+		if separator := strings.IndexByte(entry, '='); separator >= 0 {
+			name = entry[:separator]
+		}
+		if name == serviceBindAddressEnv || name == servicePortEnv {
+			return errors.Errorf("OCI image environment variable %q is reserved by the runtime", name)
+		}
+	}
+	return nil
 }
 
 func validateIsolationProfile(profile IsolationProfile) error {
@@ -1144,6 +1261,9 @@ func processFromImage(config *v1.ConfigFile) (ProcessDefinition, error) {
 	}
 	uid, gid, err := parseImageUser(config.Config.User)
 	if err != nil {
+		return ProcessDefinition{}, err
+	}
+	if err := validateReservedEnvironment(config.Config.Env); err != nil {
 		return ProcessDefinition{}, err
 	}
 	return ProcessDefinition{
