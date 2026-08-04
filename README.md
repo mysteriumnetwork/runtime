@@ -40,6 +40,21 @@ Only TCP is supported. Missing resource values receive bounded defaults;
 invalid or excessive values reject the artifact. CPU, memory, and PID limits
 are enforced when the host provides a writable delegated cgroup v2 tree.
 
+The runtime appends two reserved variables to the launched process environment:
+
+- `MYSTERIUM_SERVICE_BIND_ADDRESS`: `127.0.0.1` for a workload with a private
+  network namespace, or the service's runtime-assigned address from the managed
+  `127.64.0.0/10` host-loopback pool otherwise.
+- `MYSTERIUM_SERVICE_PORT`: the manifest's `service.internal_port` value.
+
+Workloads must listen on that exact address and port. An OCI image that declares
+either reserved variable is rejected; callers and manifests cannot provide the
+assigned address. Host-loopback assignment allows cooperative host-network
+workloads to use the same internal port, but it is not network isolation: a
+hostile workload may still bind a wildcard address or reach other host services.
+Arbitrary untrusted workloads therefore still require a private network
+namespace.
+
 ## Runtime levels
 
 The runtime reports a scheduler-facing level together with the exact isolation

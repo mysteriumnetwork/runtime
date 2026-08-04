@@ -331,11 +331,7 @@ func (backend *RuncBackend) startDirectLocked(options Options) error {
 
 	bundleDir := backend.bundleDir(options.Name)
 	launchPath := filepath.Join(bundleDir, directLaunchFileName)
-	config := directLaunchConfig{
-		RootFS:          filepath.Join(bundleDir, rootfsDirName),
-		Process:         options.Process,
-		NoNewPrivileges: options.Isolation.Features.NoNewPrivileges,
-	}
+	config := directLaunchConfigForOptions(options, filepath.Join(bundleDir, rootfsDirName))
 	if err := writeSecureJSON(launchPath, config); err != nil {
 		return errors.Wrapf(err, "cannot prepare direct runtime service %q", options.Name)
 	}
@@ -361,6 +357,16 @@ func (backend *RuncBackend) startDirectLocked(options Options) error {
 		_, _ = process.Wait()
 	}()
 	return nil
+}
+
+func directLaunchConfigForOptions(options Options, rootfs string) directLaunchConfig {
+	config := directLaunchConfig{
+		RootFS:          rootfs,
+		Process:         options.Process,
+		NoNewPrivileges: options.Isolation.Features.NoNewPrivileges,
+	}
+	config.Process.Env = processEnvironment(options)
+	return config
 }
 
 func (backend *RuncBackend) stopDirectLocked(name string) error {

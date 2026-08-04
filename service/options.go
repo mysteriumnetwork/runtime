@@ -9,7 +9,10 @@
 
 package service
 
-import "encoding/json"
+import (
+	"bytes"
+	"encoding/json"
+)
 
 // CreateOptions is the only caller-controlled runtime definition. Everything
 // executable is supplied by the digest-pinned artifact.
@@ -34,6 +37,7 @@ type Options struct {
 	Name                string            `json:"name"`
 	OCIArtifact         string            `json:"oci_artifact"`
 	ServicePort         int               `json:"service_port"`
+	ServiceBindAddress  string            `json:"service_bind_address"`
 	Process             ProcessDefinition `json:"process"`
 	ResourceLimits      ResourceLimits    `json:"resource_limits"`
 	Isolation           IsolationProfile  `json:"isolation"`
@@ -61,6 +65,8 @@ func ParseJSONOptions(request *json.RawMessage) (CreateOptions, error) {
 	if request == nil {
 		return options, nil
 	}
-	err := json.Unmarshal(*request, &options)
+	decoder := json.NewDecoder(bytes.NewReader(*request))
+	decoder.DisallowUnknownFields()
+	err := decoder.Decode(&options)
 	return options, err
 }

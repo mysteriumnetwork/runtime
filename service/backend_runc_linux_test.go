@@ -20,12 +20,15 @@
 package service
 
 import (
+	"encoding/json"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	runc "github.com/containerd/go-runc"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
@@ -58,6 +61,60 @@ func TestProcessFromImageRejectsRootUser(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("expected root image user to be rejected")
+	}
+}
+
+func TestProcessFromImageRejectsRuntimeReservedEnvironment(t *testing.T) {
+	for _, reserved := range []string{serviceBindAddressEnv, servicePortEnv} {
+		t.Run(reserved, func(t *testing.T) {
+			_, err := processFromImage(&v1.ConfigFile{Config: v1.Config{
+				Entrypoint: []string{"/bin/server"},
+				Env:        []string{reserved + "=caller-controlled"},
+				User:       "1000:1000",
+			}})
+			if err == nil || !strings.Contains(err.Error(), "reserved by the runtime") {
+				t.Fatalf("reserved environment variable was not rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestRuntimeEnvironmentInjectionIsConsistent(t *testing.T) {
+	options := testSpecOptions(IsolationProfile{
+		Name:  BestEffortIsolationProfile,
+		Level: RuntimeLevelLimited,
+		Features: IsolationFeatures{
+			MountNamespaces: true,
+			NoNewPrivileges: true,
+		},
+	})
+	options.ServiceBindAddress = "127.64.0.42"
+	options.ServicePort = 4321
+	options.Process.Env = []string{"IMAGE_VALUE=kept"}
+
+	want := []string{
+		"IMAGE_VALUE=kept",
+		serviceBindAddressEnv + "=127.64.0.42",
+		servicePortEnv + "=4321",
+	}
+	if got := processEnvironment(options); !equalStrings(got, want) {
+		t.Fatalf("processEnvironment() = %#v, want %#v", got, want)
+	}
+
+	spec, err := buildOCISpec(options, nil, nil, "", 64*1024*1024)
+	if err != nil {
+		t.Fatalf("buildOCISpec() error = %v", err)
+	}
+	if !equalStrings(spec.Process.Env, want) {
+		t.Fatalf("runc process environment = %#v, want %#v", spec.Process.Env, want)
+	}
+
+	direct := directLaunchConfigForOptions(options, "/runtime/rootfs")
+	if !equalStrings(direct.Process.Env, want) {
+		t.Fatalf("direct process environment = %#v, want %#v", direct.Process.Env, want)
+	}
+	if !equalStrings(options.Process.Env, []string{"IMAGE_VALUE=kept"}) {
+		t.Fatalf("runtime injection mutated normalized image environment: %#v", options.Process.Env)
 	}
 }
 
@@ -118,6 +175,176 @@ func TestValidateStoredOptionsAcceptsExplicitUnisolatedPolicy(t *testing.T) {
 
 	if err := validateStoredOptions(options); err != nil {
 		t.Fatalf("validateStoredOptions() error = %v", err)
+	}
+}
+
+func TestAssignServiceBindAddressAllocationLifecycle(t *testing.T) {
+	backend := &RuncBackend{services: make(map[string]Options)}
+	hostProfile := IsolationProfile{Level: RuntimeLevelLimited}
+
+	first := Options{Name: "first", ServicePort: 3000, Isolation: hostProfile}
+	if err := backend.assignServiceBindAddressLocked(&first); err != nil {
+		t.Fatal(err)
+	}
+	backend.services[first.Name] = first
+
+	second := Options{Name: "second", ServicePort: 3000, Isolation: hostProfile}
+	if err := backend.assignServiceBindAddressLocked(&second); err != nil {
+		t.Fatal(err)
+	}
+	backend.services[second.Name] = second
+
+	if first.ServiceBindAddress != "127.64.0.1" || second.ServiceBindAddress != "127.64.0.2" {
+		t.Fatalf("unexpected allocations: first=%q second=%q", first.ServiceBindAddress, second.ServiceBindAddress)
+	}
+	if first.ServiceBindAddress == second.ServiceBindAddress || first.ServicePort != second.ServicePort {
+		t.Fatal("services sharing one internal port did not receive distinct bind addresses")
+	}
+
+	update := Options{Name: first.Name, ServicePort: 4000, Isolation: hostProfile}
+	if err := backend.assignServiceBindAddressLocked(&update); err != nil {
+		t.Fatal(err)
+	}
+	if update.ServiceBindAddress != first.ServiceBindAddress {
+		t.Fatalf("update changed allocation from %q to %q", first.ServiceBindAddress, update.ServiceBindAddress)
+	}
+
+	delete(backend.services, first.Name)
+	replacement := Options{Name: "replacement", ServicePort: 3000, Isolation: hostProfile}
+	if err := backend.assignServiceBindAddressLocked(&replacement); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.ServiceBindAddress != first.ServiceBindAddress {
+		t.Fatalf("released allocation was not reused: got %q want %q", replacement.ServiceBindAddress, first.ServiceBindAddress)
+	}
+
+	namespaced := Options{
+		Name:      "namespaced",
+		Isolation: IsolationProfile{Features: IsolationFeatures{NetworkNamespaces: true}},
+	}
+	if err := backend.assignServiceBindAddressLocked(&namespaced); err != nil {
+		t.Fatal(err)
+	}
+	if namespaced.ServiceBindAddress != serviceLoopback {
+		t.Fatalf("network-namespace allocation = %q, want %q", namespaced.ServiceBindAddress, serviceLoopback)
+	}
+}
+
+func TestPersistedServiceBindAddressesReload(t *testing.T) {
+	directory := t.TempDir()
+	metadataPath := filepath.Join(directory, metadataFileName)
+	backend := &RuncBackend{
+		metadataPath: metadataPath,
+		services: map[string]Options{
+			"first":  testStoredOptions("first", "127.64.0.1", false),
+			"second": testStoredOptions("second", "127.64.0.2", false),
+		},
+	}
+	if err := backend.persistLocked(); err != nil {
+		t.Fatalf("persistLocked() error = %v", err)
+	}
+
+	reloaded, err := (&RuncBackend{metadataPath: metadataPath}).loadServices()
+	if err != nil {
+		t.Fatalf("loadServices() error = %v", err)
+	}
+	for name, want := range backend.services {
+		if got := reloaded[name].ServiceBindAddress; got != want.ServiceBindAddress {
+			t.Errorf("reloaded %q address = %q, want %q", name, got, want.ServiceBindAddress)
+		}
+	}
+}
+
+func TestLoadServicesRejectsMalformedOrDuplicateBindAddresses(t *testing.T) {
+	tests := map[string]map[string]Options{
+		"outside pool": {
+			"first": testStoredOptions("first", "127.0.0.1", false),
+		},
+		"malformed": {
+			"first": testStoredOptions("first", "not-an-address", false),
+		},
+		"duplicate": {
+			"first":  testStoredOptions("first", "127.64.0.9", false),
+			"second": testStoredOptions("second", "127.64.0.9", false),
+		},
+		"namespace non-loopback": {
+			"first": testStoredOptions("first", "127.64.0.9", true),
+		},
+	}
+	for name, services := range tests {
+		t.Run(name, func(t *testing.T) {
+			metadataPath := filepath.Join(t.TempDir(), metadataFileName)
+			data, err := json.Marshal(persistedServices{SchemaVersion: metadataSchemaVersion, Services: services})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(metadataPath, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := (&RuncBackend{metadataPath: metadataPath}).loadServices(); err == nil {
+				t.Fatal("invalid stored bind address metadata was accepted")
+			}
+		})
+	}
+}
+
+func TestReadManifestRejectsCallerControlledBindAddress(t *testing.T) {
+	rootfs := t.TempDir()
+	manifest := `{
+		"schema_version": 1,
+		"service": {
+			"protocol": "tcp",
+			"internal_port": 3000,
+			"service_bind_address": "127.64.0.99"
+		},
+		"resources": {}
+	}`
+	if err := os.WriteFile(filepath.Join(rootfs, manifestFileName), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readManifest(rootfs); err == nil {
+		t.Fatal("manifest-provided service bind address was accepted")
+	}
+}
+
+func TestParseJSONOptionsRejectsCallerControlledBindAddress(t *testing.T) {
+	raw := json.RawMessage(`{
+		"name": "service",
+		"oci_artifact": "example.invalid/service@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		"service_bind_address": "127.64.0.99"
+	}`)
+	if _, err := ParseJSONOptions(&raw); err == nil {
+		t.Fatal("caller-provided service bind address was accepted")
+	}
+}
+
+func TestDialRunningServiceSelectsNamespaceOrAssignedHostAddress(t *testing.T) {
+	var hostAddress string
+	var namespacePID, namespacePort int
+	hostDial := func(_ string, address string, _ time.Duration) (net.Conn, error) {
+		hostAddress = address
+		return nil, nil
+	}
+	namespaceDial := func(pid, port int) (net.Conn, error) {
+		namespacePID, namespacePort = pid, port
+		return nil, nil
+	}
+
+	host := Options{ServiceBindAddress: "127.64.0.7"}
+	if _, err := dialRunningService(host, 123, 3000, hostDial, namespaceDial); err != nil {
+		t.Fatal(err)
+	}
+	if hostAddress != "127.64.0.7:3000" || namespacePID != 0 {
+		t.Fatalf("host-network dial selected address=%q namespacePID=%d", hostAddress, namespacePID)
+	}
+
+	hostAddress = ""
+	namespaced := Options{Isolation: IsolationProfile{Features: IsolationFeatures{NetworkNamespaces: true}}}
+	if _, err := dialRunningService(namespaced, 456, 8080, hostDial, namespaceDial); err != nil {
+		t.Fatal(err)
+	}
+	if hostAddress != "" || namespacePID != 456 || namespacePort != 8080 {
+		t.Fatalf("namespace dial selected host=%q pid=%d port=%d", hostAddress, namespacePID, namespacePort)
 	}
 }
 
@@ -474,9 +701,14 @@ func TestBuildOCISpecUsesFullIsolationProfile(t *testing.T) {
 }
 
 func testSpecOptions(profile IsolationProfile) Options {
+	bindAddress := "127.64.0.1"
+	if profile.Features.NetworkNamespaces {
+		bindAddress = serviceLoopback
+	}
 	return Options{
-		Name:        "runtime.test",
-		ServicePort: 3000,
+		Name:               "runtime.test",
+		ServicePort:        3000,
+		ServiceBindAddress: bindAddress,
 		Process: ProcessDefinition{
 			Args: []string{"/bin/server"},
 			Cwd:  "/",
@@ -491,6 +723,59 @@ func testSpecOptions(profile IsolationProfile) Options {
 		},
 		Isolation: profile,
 	}
+}
+
+func testStoredOptions(name, bindAddress string, networkNamespace bool) Options {
+	profile := IsolationProfile{
+		Name:  UnisolatedProfile,
+		Level: RuntimeLevelUnisolated,
+		Features: IsolationFeatures{
+			FilesystemJail:      true,
+			NonRootUser:         true,
+			CapabilitiesDropped: true,
+			NoNewPrivileges:     true,
+		},
+	}
+	minimum := RuntimeLevelUnisolated
+	if networkNamespace {
+		profile = IsolationProfile{
+			Name:  FullIsolationProfile,
+			Level: RuntimeLevelFull,
+			Features: IsolationFeatures{
+				FilesystemJail:      true,
+				NonRootUser:         true,
+				CapabilitiesDropped: true,
+				UserNamespaces:      true,
+				MountNamespaces:     true,
+				PIDNamespaces:       true,
+				NetworkNamespaces:   true,
+				IPCNamespaces:       true,
+				Cgroups:             true,
+				Seccomp:             true,
+				NoNewPrivileges:     true,
+				ReadOnlyRootFS:      true,
+			},
+		}
+		minimum = RuntimeLevelFull
+	}
+	options := testSpecOptions(profile)
+	options.Name = name
+	options.OCIArtifact = "example.invalid/" + name + "@sha256:" + strings.Repeat("0", 64)
+	options.ServiceBindAddress = bindAddress
+	options.MinimumRuntimeLevel = minimum
+	return options
+}
+
+func equalStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func hasNamespace(namespaces []specs.LinuxNamespace, expected specs.LinuxNamespaceType) bool {
