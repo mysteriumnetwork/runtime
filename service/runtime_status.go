@@ -253,5 +253,6 @@ func cloneRuntimeStatus(status RuntimeStatus) RuntimeStatus {
 	status.MissingForLimited = append([]string(nil), status.MissingForLimited...)
 	status.MissingForFull = append([]string(nil), status.MissingForFull...)
 	status.BlockingReasons = append([]string(nil), status.BlockingReasons...)
+	status.Notices = append([]string(nil), status.Notices...)
 	return status
 }

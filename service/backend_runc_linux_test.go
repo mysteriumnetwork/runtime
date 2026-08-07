@@ -28,6 +28,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -261,7 +262,7 @@ func TestPersistedServiceBindAddressesReload(t *testing.T) {
 	}
 }
 
-func TestLoadServicesRejectsMalformedOrDuplicateBindAddresses(t *testing.T) {
+func TestLoadServicesQuarantinesMalformedOrDuplicateBindAddresses(t *testing.T) {
 	tests := map[string]map[string]Options{
 		"outside pool": {
 			"first": testStoredOptions("first", "127.0.0.1", false),
@@ -287,10 +288,307 @@ func TestLoadServicesRejectsMalformedOrDuplicateBindAddresses(t *testing.T) {
 			if err := os.WriteFile(metadataPath, data, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if _, err := (&RuncBackend{metadataPath: metadataPath}).loadServices(); err == nil {
-				t.Fatal("invalid stored bind address metadata was accepted")
+
+			backend := &RuncBackend{metadataPath: metadataPath}
+			loaded, err := backend.loadServices()
+			if err != nil {
+				t.Fatalf("loadServices() error = %v, want recovery", err)
+			}
+			if len(loaded) != 0 {
+				t.Fatalf("invalid stored bind address metadata was accepted: %v", loaded)
+			}
+			if _, err := os.Stat(metadataPath); !os.IsNotExist(err) {
+				t.Fatalf("unusable metadata was left in place, stat error = %v", err)
+			}
+			if len(backend.notices) != 1 {
+				t.Fatalf("notices = %v, want one recovery notice", backend.notices)
+			}
+			if !strings.Contains(backend.notices[0], ".unusable-") {
+				t.Errorf("notice %q does not name the quarantined file", backend.notices[0])
 			}
 		})
+	}
+}
+
+func TestLoadServicesQuarantinesTruncatedAndLegacyMetadata(t *testing.T) {
+	tests := map[string]string{
+		"truncated write": `{"schema_version":3,"services":{"first":`,
+		"legacy schema":   `{"schema_version":2,"services":{}}`,
+		"not json":        "\x00\x00\x00",
+	}
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			directory := t.TempDir()
+			metadataPath := filepath.Join(directory, metadataFileName)
+			if err := os.WriteFile(metadataPath, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			backend := &RuncBackend{metadataPath: metadataPath}
+			loaded, err := backend.loadServices()
+			if err != nil {
+				t.Fatalf("loadServices() error = %v, want recovery", err)
+			}
+			if len(loaded) != 0 {
+				t.Fatalf("loaded = %v, want no definitions", loaded)
+			}
+			if len(backend.notices) != 1 {
+				t.Fatalf("notices = %v, want one recovery notice", backend.notices)
+			}
+
+			// The original bytes must survive for operator inspection.
+			entries, err := os.ReadDir(directory)
+			if err != nil {
+				t.Fatal(err)
+			}
+			quarantined := ""
+			for _, entry := range entries {
+				if strings.Contains(entry.Name(), ".unusable-") {
+					quarantined = filepath.Join(directory, entry.Name())
+				}
+			}
+			if quarantined == "" {
+				t.Fatalf("no quarantined metadata in %v", entries)
+			}
+			preserved, err := os.ReadFile(quarantined)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(preserved) != content {
+				t.Errorf("quarantined content = %q, want %q", preserved, content)
+			}
+		})
+	}
+}
+
+// Metadata that exists but cannot be read is a host fault, not bad content.
+// Discarding definitions there would turn a transient I/O or permission failure
+// into permanent data loss, so it must stay fatal and leave the path untouched.
+func TestLoadServicesFailsOnUnreadableMetadata(t *testing.T) {
+	unreadable := map[string]func(t *testing.T) string{
+		// EISDIR, which root cannot bypass.
+		"not a regular file": func(t *testing.T) string {
+			path := filepath.Join(t.TempDir(), metadataFileName)
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+		"permission denied": func(t *testing.T) string {
+			if os.Geteuid() == 0 {
+				t.Skip("root bypasses file permission checks")
+			}
+			path := filepath.Join(t.TempDir(), metadataFileName)
+			if err := os.WriteFile(path, []byte("{}"), 0o000); err != nil {
+				t.Fatal(err)
+			}
+			return path
+		},
+	}
+	for name, setup := range unreadable {
+		t.Run(name, func(t *testing.T) {
+			metadataPath := setup(t)
+
+			backend := &RuncBackend{metadataPath: metadataPath}
+			if _, err := backend.loadServices(); err == nil {
+				t.Fatal("unreadable metadata was silently discarded")
+			}
+			if len(backend.notices) != 0 {
+				t.Errorf("notices = %v, want none for a host fault", backend.notices)
+			}
+			if _, err := os.Lstat(metadataPath); err != nil {
+				t.Errorf("unreadable metadata was not left in place: %v", err)
+			}
+		})
+	}
+}
+
+func TestPersistLockedSurvivesTruncatedPreviousContent(t *testing.T) {
+	directory := t.TempDir()
+	metadataPath := filepath.Join(directory, metadataFileName)
+	if err := os.WriteFile(metadataPath, []byte(`{"schema_version":3,"services":{"stale":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	backend := &RuncBackend{
+		metadataPath: metadataPath,
+		services:     map[string]Options{"first": testStoredOptions("first", "127.64.0.1", false)},
+	}
+	if err := backend.persistLocked(); err != nil {
+		t.Fatalf("persistLocked() error = %v", err)
+	}
+
+	reloaded, err := (&RuncBackend{metadataPath: metadataPath}).loadServices()
+	if err != nil {
+		t.Fatalf("loadServices() error = %v", err)
+	}
+	if len(reloaded) != 1 || reloaded["first"].ServiceBindAddress != "127.64.0.1" {
+		t.Fatalf("reloaded = %v, want the newly persisted definition", reloaded)
+	}
+
+	// The replacement must not leave staging files behind.
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != metadataFileName {
+		t.Errorf("directory contains leftover files: %v", entries)
+	}
+}
+
+func newStagingTestBackend(t *testing.T) *RuncBackend {
+	t.Helper()
+	baseDir := t.TempDir()
+	bundlesDir := filepath.Join(baseDir, bundlesDirName)
+	if err := os.MkdirAll(bundlesDir, 0o711); err != nil {
+		t.Fatal(err)
+	}
+	return &RuncBackend{
+		baseDir:      baseDir,
+		bundlesDir:   bundlesDir,
+		metadataPath: filepath.Join(baseDir, metadataFileName),
+		services:     make(map[string]Options),
+		pending:      make(map[string]struct{}),
+	}
+}
+
+// The reservation exists so that Create can release the backend lock across the
+// registry pull. If the lock were still held, no other operation could run --
+// including the per-connection DialTCP the proxy depends on.
+func TestStagingReservationLeavesBackendLockAvailable(t *testing.T) {
+	backend := newStagingTestBackend(t)
+
+	stagingDir, err := backend.reserveStaging("first")
+	if err != nil {
+		t.Fatalf("reserveStaging() error = %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, listErr := backend.List()
+		done <- listErr
+	}()
+
+	select {
+	case listErr := <-done:
+		if listErr != nil {
+			t.Fatalf("List() error = %v", listErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("List blocked while a create reservation was held")
+	}
+
+	backend.releaseStaging("first", stagingDir)
+}
+
+func TestReserveStagingRejectsConcurrentCreateOfSameName(t *testing.T) {
+	backend := newStagingTestBackend(t)
+
+	stagingDir, err := backend.reserveStaging("first")
+	if err != nil {
+		t.Fatalf("reserveStaging() error = %v", err)
+	}
+	if _, err := backend.reserveStaging("first"); err == nil {
+		t.Fatal("a second concurrent create for the same name was accepted")
+	}
+
+	// A different name may still be staged concurrently.
+	otherDir, err := backend.reserveStaging("second")
+	if err != nil {
+		t.Fatalf("reserveStaging(second) error = %v", err)
+	}
+	if otherDir == stagingDir {
+		t.Fatal("concurrent creates shared a staging directory")
+	}
+
+	backend.releaseStaging("first", stagingDir)
+	backend.releaseStaging("second", otherDir)
+
+	if _, err := backend.reserveStaging("first"); err != nil {
+		t.Fatalf("reserveStaging() after release error = %v", err)
+	}
+}
+
+func TestReleaseStagingRemovesStagingDirectory(t *testing.T) {
+	backend := newStagingTestBackend(t)
+
+	stagingDir, err := backend.reserveStaging("first")
+	if err != nil {
+		t.Fatalf("reserveStaging() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stagingDir, rootfsDirName)); err != nil {
+		t.Fatalf("staged rootfs was not created: %v", err)
+	}
+
+	backend.releaseStaging("first", stagingDir)
+
+	if _, err := os.Stat(stagingDir); !os.IsNotExist(err) {
+		t.Errorf("staging directory survived release, stat error = %v", err)
+	}
+	if len(backend.pending) != 0 {
+		t.Errorf("pending = %v, want empty", backend.pending)
+	}
+}
+
+// A successful install renames the staging directory into place, so the
+// deferred release must not remove the installed bundle.
+func TestReleaseStagingAfterInstallKeepsBundle(t *testing.T) {
+	backend := newStagingTestBackend(t)
+
+	stagingDir, err := backend.reserveStaging("first")
+	if err != nil {
+		t.Fatalf("reserveStaging() error = %v", err)
+	}
+	bundleDir := backend.bundleDir("first")
+	if err := os.Rename(stagingDir, bundleDir); err != nil {
+		t.Fatal(err)
+	}
+
+	backend.releaseStaging("first", stagingDir)
+
+	if _, err := os.Stat(bundleDir); err != nil {
+		t.Errorf("installed bundle was removed by release: %v", err)
+	}
+}
+
+func TestCheckCreateAllowedLockedEnforcesInstallLimit(t *testing.T) {
+	backend := newStagingTestBackend(t)
+	for i := 0; i < maxInstalledServices; i++ {
+		name := "service" + strconv.Itoa(i)
+		backend.services[name] = testStoredOptions(name, "127.64.0."+strconv.Itoa(i+1), false)
+	}
+
+	if err := backend.checkCreateAllowedLocked("overflow"); err == nil {
+		t.Fatal("install limit was not enforced")
+	}
+	// Replacing an installed definition stays allowed at the limit.
+	if err := backend.checkCreateAllowedLocked("service0"); err != nil {
+		t.Errorf("replacing an installed service was rejected: %v", err)
+	}
+}
+
+func TestWriteFileAtomicReplacesContentAndPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := writeFileAtomic(path, []byte("first")); err != nil {
+		t.Fatalf("writeFileAtomic() error = %v", err)
+	}
+	if err := writeFileAtomic(path, []byte("second")); err != nil {
+		t.Fatalf("writeFileAtomic() rewrite error = %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "second" {
+		t.Errorf("content = %q, want %q", data, "second")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v, want 0600", info.Mode().Perm())
 	}
 }
 

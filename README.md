@@ -110,6 +110,18 @@ process's `/proc/<pid>/ns/net` handle, and a startup probe confirms that outer
 security policy permits `setns`. Without these permissions, a limited workload
 shares the runtime's network namespace; full isolation is unavailable.
 
+**A private network namespace means loopback only.** The runtime configures `lo`
+and nothing else: no veth pair, no bridge, no NAT. A workload in a private
+network namespace has no outbound connectivity and is reachable only through
+`Backend.DialTCP`. A workload that instead shares the runtime's network
+namespace has whatever access the runtime process has, including egress.
+
+This is the one axis on which the profiles differ in capability rather than in
+isolation strength, so it is not a difference a workload can ignore: an image
+that reaches the network at runtime will work on a host that selects a shared
+network namespace and fail on a host that selects a private one. Workloads
+intended for arbitrary hosts must not require egress.
+
 The selected profile and its exact feature vector are persisted with each
 installed workload and returned by `list`; a workload is never silently
 retried with weaker isolation at start. Runtime status also reports
@@ -138,21 +150,31 @@ feature vector because two `limited` devices may provide different guarantees.
 
 ## 1. Architecture
 
-The runtime architecture decomposes container and workload execution into six independent packages:
+The runtime is two packages:
 
 ```
 runtime/
 ├── capabilities/    # Probes host environment and reports kernel feature support
-├── resources/       # Cgroup v2 resource limiting
-├── namespaces/      # Linux namespace topology abstractions (user, mnt, pid, net, ipc, uts)
-├── filesystem/      # Rootfs preparation, read-only rootfs enforcement, and bind-mounts
-├── network/         # Workload networking topology, bridge setup, and port forwarding
-└── security/        # Seccomp profiles, capability dropping, and no_new_privs rules
+└── service/         # Workload lifecycle: profile selection, bundle preparation, execution
 ```
 
-This clean separation ensures that changes in isolation mechanisms (e.g., adding Landlock or switching from runc to crun) do not require changes to service managers or workload execution code.
+`capabilities` answers "what can this host do?" and has no knowledge of
+workloads. `service` turns that answer into a concrete isolation profile,
+prepares the OCI bundle, and executes it.
 
-## 5. Library and CLI
+Within `service`, isolation is not applied by hand. `assessRuntime` selects the
+profile, `buildOCISpec` encodes every namespace, cgroup, seccomp, capability,
+and mount decision into a single generated `config.json`, and `runc` enforces
+it. The one exception is the `unisolated-v1` path, where the built-in direct
+executor applies its much smaller set of protections itself, because no OCI
+runtime is involved.
+
+That means there is exactly one place to change an isolation mechanism for
+OCI-executed workloads: the generated spec in `buildOCISpec`, plus the feature
+vector that decides what goes into it. Adding Landlock or switching to `crun`
+is a change to `service`, not a new subsystem.
+
+## 2. Library and CLI
 
 This module also provides:
 
@@ -273,7 +295,7 @@ manifest-defined service port and bridges a local listener through
 
 ---
 
-## 2. Capability Detection Strategy
+## 3. Capability Detection Strategy
 
 The `capabilities` package dynamically inspects the execution environment at startup without relying on heuristics such as checking for `.dockerenv`, parsing `/proc/1/cgroup`, or assuming privileges based on containerization. Instead, it probes actual kernel features:
 
@@ -292,36 +314,49 @@ The detector provides both a simplified boolean API (`RuntimeCapabilities`) for 
 
 ---
 
-## 3. Cgroup Resource Isolation
+## 4. Cgroup Resource Isolation
 
-The `resources` package defines a generic `ResourceLimiter` interface:
-```go
-type ResourceLimiter interface {
-    Create(id string, limits ResourceLimits) error
-    Attach(pid int) error
-    Destroy(id string) error
-}
-```
+Resource limits are not applied by the runtime directly. The manifest's
+`resources` block is validated into a `ResourceLimits` value, encoded into the
+generated OCI spec as `linux.resources` under a `cgroupsPath` beneath the
+runtime's own delegated cgroup, and enforced by `runc`.
 
-When a writable delegated cgroup v2 tree is available, resource limits apply
-to the entire workload process tree: `cpu.max` controls CPU bandwidth,
-`memory.max` caps memory usage, and `pids.max` limits the number of processes.
-Without it, trusted workloads may still run under the limited profile, and the
-runtime reports that cgroup resource isolation is absent.
+When a writable delegated cgroup v2 tree is available, the limits apply to the
+entire workload process tree: `cpu.max` controls CPU bandwidth, `memory.max`
+caps memory usage, and `pids.max` limits the number of processes. Without it,
+the spec omits both `cgroupsPath` and `linux.resources`, `runc` runs in its
+rootless cgroup mode, trusted workloads may still run under the limited profile,
+and the runtime reports that cgroup resource isolation is absent through
+`IsolationFeatures.Cgroups` and `missing_for_full`.
+
+Note that `disk` is not a persistent-storage limit. It sizes the workload's
+`/tmp` tmpfs, and tmpfs pages are charged to the workload's memory cgroup, so a
+workload that fills `/tmp` consumes its `memory` budget and will be OOM-killed
+rather than receiving a write error.
 
 ---
 
-## 4. Future Extension Points
+## 5. Future Extension Points
 
-The architecture provides clear extension points for emerging Linux security and isolation technologies:
+None of the following is implemented. Each is a change to `service`, and each
+would need a new `IsolationFeatures` entry so that the guarantee is reported and
+re-checked at start rather than silently assumed:
 
 1. **OCI Runtime Selection (runc vs. crun)**:
-   The `service` backend can be extended to detect installed OCI runtime binaries (`crun`, `runc`, `youki`) and dynamically select lightweight C-based runtimes (`crun`) when available.
-2. **Landlock File Sandboxing**:
-   The `security` package includes a stub for Landlock (`Linux 5.13+`). Workloads running without root privileges or mount namespaces can use Landlock rules to restrict filesystem access unprivilege-wide.
-3. **Idmapped Mounts**:
-   The `filesystem` package supports configuring `IdMapped: true`, enabling user namespace uid/gid shifting on bind mounts without recursively `chown`-ing the underlying files (`Linux 5.12+`).
-4. **Cgroup Delegation & Rootless Execution**:
-   When `UserNamespaces` and cgroup v2 delegation (`cgroup.controllers` delegated to unprivileged users via systemd/logind) are detected, the runtime can launch rootless containers seamlessly without root daemon privileges.
-5. **Custom Network Namespace Providers**:
-   The `network` package interface permits plugging in external CNI plugins, user-mode TCP/IP stacks (such as slirp4netns or pasta), or WireGuard-backed network interfaces directly into isolated container network namespaces.
+   `newRuncBackend` hardcodes `runc.DefaultCommand`. It could probe for `crun`
+   or `youki` and select a lighter runtime when available.
+2. **Landlock File Sandboxing** (`Linux 5.13+`):
+   Would restrict filesystem access for workloads that cannot get a mount
+   namespace, which is the main gap in the `unisolated-v1` path.
+3. **Idmapped Mounts** (`Linux 5.12+`):
+   Would allow user-namespace UID/GID shifting without the recursive `chown`
+   that `extractImageRootFS` performs today, cutting bundle preparation cost for
+   large images.
+4. **Outbound Networking for Isolated Workloads**:
+   A workload with a private network namespace currently has loopback only. A
+   veth pair, slirp4netns/pasta, or a WireGuard-backed interface would give it
+   egress without giving it the host's network namespace, which is the only
+   alternative the runtime offers today.
+5. **Persistent Workload Storage**:
+   There is no durable per-workload volume; `/tmp` is memory-backed tmpfs and
+   the rootfs is read-only under `full-v1`.

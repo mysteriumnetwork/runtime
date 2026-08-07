@@ -67,7 +67,9 @@ type IsolationProfile struct {
 
 // RuntimeStatus is the scheduler-facing assessment of this runtime.
 // MissingForFull explains why an otherwise usable runtime is limited, while
-// BlockingReasons explains why no workload can be spawned.
+// BlockingReasons explains why no workload can be spawned. Notices report
+// recovered faults that did not block startup but that an operator should see,
+// such as runtime definitions discarded during metadata recovery.
 type RuntimeStatus struct {
 	Level             RuntimeLevel     `json:"level"`
 	Profile           IsolationProfile `json:"profile"`
@@ -77,6 +79,7 @@ type RuntimeStatus struct {
 	MissingForLimited []string         `json:"missing_for_limited,omitempty"`
 	MissingForFull    []string         `json:"missing_for_full,omitempty"`
 	BlockingReasons   []string         `json:"blocking_reasons,omitempty"`
+	Notices           []string         `json:"notices,omitempty"`
 }
 
 // Backend defines runtime service lifecycle operations.
