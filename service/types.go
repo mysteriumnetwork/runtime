@@ -14,10 +14,14 @@ const (
 	ServiceStatePassive ServiceState = "passive"
 )
 
-// ServiceInfo describes a runtime-defined service known to the backend.
+// ServiceInfo describes a runtime-defined service known to the backend. State
+// is what the workload is doing right now; Desired is the persisted intent that
+// survives a restart. They differ while a service is being restored, or when a
+// workload could not be brought back to its recorded state.
 type ServiceInfo struct {
 	Name    string       `json:"name"`
 	State   ServiceState `json:"state"`
+	Desired ServiceState `json:"desired_state"`
 	Options Options      `json:"options,omitempty"`
 }
 

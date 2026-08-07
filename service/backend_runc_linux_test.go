@@ -251,7 +251,7 @@ func TestPersistedServiceBindAddressesReload(t *testing.T) {
 		t.Fatalf("persistLocked() error = %v", err)
 	}
 
-	reloaded, err := (&RuncBackend{metadataPath: metadataPath}).loadServices()
+	reloaded, _, err := (&RuncBackend{metadataPath: metadataPath}).loadServices()
 	if err != nil {
 		t.Fatalf("loadServices() error = %v", err)
 	}
@@ -290,7 +290,7 @@ func TestLoadServicesQuarantinesMalformedOrDuplicateBindAddresses(t *testing.T) 
 			}
 
 			backend := &RuncBackend{metadataPath: metadataPath}
-			loaded, err := backend.loadServices()
+			loaded, _, err := backend.loadServices()
 			if err != nil {
 				t.Fatalf("loadServices() error = %v, want recovery", err)
 			}
@@ -312,7 +312,7 @@ func TestLoadServicesQuarantinesMalformedOrDuplicateBindAddresses(t *testing.T) 
 
 func TestLoadServicesQuarantinesTruncatedAndLegacyMetadata(t *testing.T) {
 	tests := map[string]string{
-		"truncated write": `{"schema_version":3,"services":{"first":`,
+		"truncated write": `{"schema_version":1,"services":{"first":`,
 		"legacy schema":   `{"schema_version":2,"services":{}}`,
 		"not json":        "\x00\x00\x00",
 	}
@@ -325,7 +325,7 @@ func TestLoadServicesQuarantinesTruncatedAndLegacyMetadata(t *testing.T) {
 			}
 
 			backend := &RuncBackend{metadataPath: metadataPath}
-			loaded, err := backend.loadServices()
+			loaded, _, err := backend.loadServices()
 			if err != nil {
 				t.Fatalf("loadServices() error = %v, want recovery", err)
 			}
@@ -390,7 +390,7 @@ func TestLoadServicesFailsOnUnreadableMetadata(t *testing.T) {
 			metadataPath := setup(t)
 
 			backend := &RuncBackend{metadataPath: metadataPath}
-			if _, err := backend.loadServices(); err == nil {
+			if _, _, err := backend.loadServices(); err == nil {
 				t.Fatal("unreadable metadata was silently discarded")
 			}
 			if len(backend.notices) != 0 {
@@ -406,7 +406,7 @@ func TestLoadServicesFailsOnUnreadableMetadata(t *testing.T) {
 func TestPersistLockedSurvivesTruncatedPreviousContent(t *testing.T) {
 	directory := t.TempDir()
 	metadataPath := filepath.Join(directory, metadataFileName)
-	if err := os.WriteFile(metadataPath, []byte(`{"schema_version":3,"services":{"stale":`), 0o600); err != nil {
+	if err := os.WriteFile(metadataPath, []byte(`{"schema_version":1,"services":{"stale":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -418,7 +418,7 @@ func TestPersistLockedSurvivesTruncatedPreviousContent(t *testing.T) {
 		t.Fatalf("persistLocked() error = %v", err)
 	}
 
-	reloaded, err := (&RuncBackend{metadataPath: metadataPath}).loadServices()
+	reloaded, _, err := (&RuncBackend{metadataPath: metadataPath}).loadServices()
 	if err != nil {
 		t.Fatalf("loadServices() error = %v", err)
 	}
@@ -1223,4 +1223,103 @@ func hasNamespace(namespaces []specs.LinuxNamespace, expected specs.LinuxNamespa
 		}
 	}
 	return false
+}
+
+func TestDesiredStateSurvivesAReload(t *testing.T) {
+	metadataPath := filepath.Join(t.TempDir(), metadataFileName)
+	backend := &RuncBackend{
+		metadataPath: metadataPath,
+		services: map[string]Options{
+			"active":  testStoredOptions("active", "127.64.0.1", false),
+			"passive": testStoredOptions("passive", "127.64.0.2", false),
+		},
+		desired: map[string]ServiceState{"active": ServiceStateActive},
+	}
+	if err := backend.persistLocked(); err != nil {
+		t.Fatalf("persistLocked() error = %v", err)
+	}
+
+	services, states, err := (&RuncBackend{metadataPath: metadataPath}).loadServices()
+	if err != nil {
+		t.Fatalf("loadServices() error = %v", err)
+	}
+	if len(services) != 2 {
+		t.Fatalf("reloaded %d definitions, want 2", len(services))
+	}
+	if states["active"] != ServiceStateActive {
+		t.Errorf("reloaded state for %q = %q, want %q", "active", states["active"], ServiceStateActive)
+	}
+	if states["passive"] != ServiceStatePassive {
+		t.Errorf("reloaded state for %q = %q, want %q", "passive", states["passive"], ServiceStatePassive)
+	}
+}
+
+// The two halves of the file disagreeing is corruption, not something to guess
+// at, so it takes the same quarantine path as any other unusable metadata.
+func TestLoadServicesQuarantinesInconsistentStates(t *testing.T) {
+	tests := map[string]persistedServices{
+		"state without definition": {
+			SchemaVersion: metadataSchemaVersion,
+			Services:      map[string]Options{"first": testStoredOptions("first", "127.64.0.1", false)},
+			States:        map[string]ServiceState{"ghost": ServiceStateActive},
+		},
+		"unknown state value": {
+			SchemaVersion: metadataSchemaVersion,
+			Services:      map[string]Options{"first": testStoredOptions("first", "127.64.0.1", false)},
+			States:        map[string]ServiceState{"first": ServiceState("halfway")},
+		},
+	}
+	for name, persisted := range tests {
+		t.Run(name, func(t *testing.T) {
+			metadataPath := filepath.Join(t.TempDir(), metadataFileName)
+			data, err := json.Marshal(persisted)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(metadataPath, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			backend := &RuncBackend{metadataPath: metadataPath}
+			loaded, _, err := backend.loadServices()
+			if err != nil {
+				t.Fatalf("loadServices() error = %v, want recovery", err)
+			}
+			if len(loaded) != 0 {
+				t.Fatalf("inconsistent metadata was accepted: %v", loaded)
+			}
+			if len(backend.notices) != 1 {
+				t.Fatalf("notices = %v, want one recovery notice", backend.notices)
+			}
+		})
+	}
+}
+
+func TestSetDesiredPersistsOnlyOnChange(t *testing.T) {
+	metadataPath := filepath.Join(t.TempDir(), metadataFileName)
+	backend := &RuncBackend{
+		metadataPath: metadataPath,
+		services:     map[string]Options{"first": testStoredOptions("first", "127.64.0.1", false)},
+		desired:      map[string]ServiceState{"first": ServiceStatePassive},
+	}
+
+	if err := backend.setDesiredLocked("first", ServiceStateActive); err != nil {
+		t.Fatalf("setDesiredLocked() error = %v", err)
+	}
+	_, states, err := (&RuncBackend{metadataPath: metadataPath}).loadServices()
+	if err != nil {
+		t.Fatalf("loadServices() error = %v", err)
+	}
+	if states["first"] != ServiceStateActive {
+		t.Fatalf("state = %q, want %q", states["first"], ServiceStateActive)
+	}
+
+	// An unknown name has no definition to attach state to and must not create
+	// an entry that would fail to load.
+	if err := backend.setDesiredLocked("ghost", ServiceStateActive); err != nil {
+		t.Fatalf("setDesiredLocked() error = %v", err)
+	}
+	if _, tracked := backend.desired["ghost"]; tracked {
+		t.Error("state was recorded for a definition that does not exist")
+	}
 }
