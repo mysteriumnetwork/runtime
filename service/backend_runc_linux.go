@@ -76,15 +76,16 @@ const (
 	maxManifestSize       = 64 * 1024
 	maxRootFSSize         = uint64(1024 * 1024 * 1024)
 	maxInstalledServices  = 4
-	metadataSchemaVersion = 3
+	metadataSchemaVersion = 1
 )
 
 var serviceNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 var serviceBindAddressPool = netip.MustParsePrefix("127.64.0.0/10")
 
 type persistedServices struct {
-	SchemaVersion int                `json:"schema_version"`
-	Services      map[string]Options `json:"services"`
+	SchemaVersion int                     `json:"schema_version"`
+	Services      map[string]Options      `json:"services"`
+	States        map[string]ServiceState `json:"states,omitempty"`
 }
 
 // RuncBackend manages OCI-isolated services via runc and explicitly trusted
@@ -97,6 +98,11 @@ type RuncBackend struct {
 	metadataPath string
 	runc         *runc.Runc
 	services     map[string]Options
+	// desired records the state each definition should be in. It is persisted
+	// alongside the definitions so that a service left active by the previous
+	// process can be brought back up by the next one, and so that a service that
+	// was deliberately stopped stays down.
+	desired map[string]ServiceState
 	// pending holds service names whose bundle is being staged. Create releases
 	// mu while pulling the artifact, and this keeps two concurrent creates for
 	// the same name from racing each other's install.
@@ -130,6 +136,7 @@ func newRuncBackend(runtimeDir string) *RuncBackend {
 			LogFormat: runc.JSON,
 		},
 		services:     make(map[string]Options),
+		desired:      make(map[string]ServiceState),
 		pending:      make(map[string]struct{}),
 		caps:         caps,
 		detailedCaps: detailedCaps,
@@ -171,11 +178,12 @@ func (backend *RuncBackend) initialize() error {
 		backend.runc.Log = filepath.Join(evalDir, runcLogFileName)
 	}
 
-	services, err := backend.loadServices()
+	services, states, err := backend.loadServices()
 	if err != nil {
 		return err
 	}
 	backend.services = services
+	backend.desired = states
 	return nil
 }
 
@@ -318,6 +326,9 @@ func (backend *RuncBackend) installBundle(input CreateOptions, preparedOptions O
 
 	oldOptions, hadOptions := backend.services[input.Name]
 	backend.services[preparedOptions.Name] = preparedOptions
+	// A create can only land while the service is inactive, so the definition
+	// starts out passive and is only marked active by an explicit Start.
+	backend.desired[preparedOptions.Name] = ServiceStatePassive
 	if err := backend.persistLocked(); err != nil {
 		_ = os.RemoveAll(bundleDir)
 		if hadBundle {
@@ -327,6 +338,7 @@ func (backend *RuncBackend) installBundle(input CreateOptions, preparedOptions O
 			backend.services[input.Name] = oldOptions
 		} else {
 			delete(backend.services, input.Name)
+			delete(backend.desired, input.Name)
 		}
 		return err
 	}
@@ -352,10 +364,15 @@ func (backend *RuncBackend) Delete(name string) error {
 		}
 	}
 
+	previousState, hadState := backend.desired[name]
 	delete(backend.services, name)
+	delete(backend.desired, name)
 	if err := backend.persistLocked(); err != nil {
 		if exists {
 			backend.services[name] = options
+		}
+		if hadState {
+			backend.desired[name] = previousState
 		}
 		return err
 	}
@@ -396,13 +413,37 @@ func (backend *RuncBackend) Start(name string) error {
 		if _, err := os.Stat(filepath.Join(bundleDir, rootfsDirName)); err != nil {
 			return errors.Wrapf(err, "runtime service %q has no validated rootfs", name)
 		}
-		return backend.startDirectLocked(options)
+		if err := backend.startDirectLocked(options); err != nil {
+			return err
+		}
+		return backend.recordStartedLocked(options)
 	}
 	if _, err := os.Stat(filepath.Join(bundleDir, configFileName)); err != nil {
 		return errors.Wrapf(err, "runtime service %q has no validated OCI bundle", name)
 	}
 
-	return backend.startRuncLocked(options, bundleDir)
+	if err := backend.startRuncLocked(options, bundleDir); err != nil {
+		return err
+	}
+	return backend.recordStartedLocked(options)
+}
+
+// recordStartedLocked marks a started service active. If the state cannot reach
+// disk the workload is torn down again: leaving it up would contradict both the
+// error returned to the caller and the passive state still on disk, which the
+// next boot would act on by stopping it anyway.
+func (backend *RuncBackend) recordStartedLocked(options Options) error {
+	err := backend.setDesiredLocked(options.Name, ServiceStateActive)
+	if err == nil {
+		return nil
+	}
+	if stopErr := backend.stopContainerLocked(options); stopErr != nil {
+		return errors.Wrapf(err,
+			"runtime service %q is running but its state could not be recorded, and it could not be stopped (%s)",
+			options.Name, stopErr,
+		)
+	}
+	return errors.Wrapf(err, "runtime service %q was stopped because its state could not be recorded", options.Name)
 }
 
 func (backend *RuncBackend) startRuncLocked(options Options, bundleDir string) error {
@@ -485,7 +526,10 @@ func (backend *RuncBackend) Stop(name string) error {
 	if !exists {
 		return nil
 	}
-	return backend.stopContainerLocked(options)
+	if err := backend.stopContainerLocked(options); err != nil {
+		return err
+	}
+	return backend.setDesiredLocked(name, ServiceStatePassive)
 }
 
 // DialTCP connects to a TCP listener on loopback inside a running workload.
@@ -569,7 +613,16 @@ func (backend *RuncBackend) List() ([]ServiceInfo, error) {
 		if _, ok := active[name]; ok {
 			state = ServiceStateActive
 		}
-		result = append(result, ServiceInfo{Name: name, State: state, Options: options})
+		desired := ServiceStatePassive
+		if backend.desired[name] == ServiceStateActive {
+			desired = ServiceStateActive
+		}
+		result = append(result, ServiceInfo{
+			Name:    name,
+			State:   state,
+			Desired: desired,
+			Options: options,
+		})
 	}
 
 	sort.Slice(result, func(i, j int) bool {
@@ -1013,21 +1066,21 @@ func buildOCISpec(
 	}, nil
 }
 
-func (backend *RuncBackend) loadServices() (map[string]Options, error) {
+func (backend *RuncBackend) loadServices() (map[string]Options, map[string]ServiceState, error) {
 	data, err := os.ReadFile(backend.metadataPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return make(map[string]Options), nil
+			return make(map[string]Options), make(map[string]ServiceState), nil
 		}
 		// A metadata file that exists but cannot be read is a host problem, not
 		// a content problem. Discarding definitions here could hide a transient
 		// I/O or permission fault, so this stays fatal.
-		return nil, errors.Wrap(err, "failed to read runtime metadata")
+		return nil, nil, errors.Wrap(err, "failed to read runtime metadata")
 	}
 
-	services, decodeErr := decodeServices(data)
+	services, states, decodeErr := decodeServices(data)
 	if decodeErr == nil {
-		return services, nil
+		return services, states, nil
 	}
 
 	// Unusable content is never executed, so moving it aside and starting empty
@@ -1037,13 +1090,13 @@ func (backend *RuncBackend) loadServices() (map[string]Options, error) {
 	// inert without a definition referencing them.
 	quarantinePath, err := backend.quarantineMetadata()
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to quarantine unusable runtime metadata (%s)", decodeErr)
+		return nil, nil, errors.Wrapf(err, "failed to quarantine unusable runtime metadata (%s)", decodeErr)
 	}
 	backend.notices = append(backend.notices, fmt.Sprintf(
 		"unusable runtime metadata was moved to %s and all runtime definitions were discarded: %s",
 		quarantinePath, decodeErr,
 	))
-	return make(map[string]Options), nil
+	return make(map[string]Options), make(map[string]ServiceState), nil
 }
 
 // quarantineMetadata moves the current metadata file aside for operator
@@ -1059,13 +1112,13 @@ func (backend *RuncBackend) quarantineMetadata() (string, error) {
 	return quarantinePath, nil
 }
 
-func decodeServices(data []byte) (map[string]Options, error) {
+func decodeServices(data []byte) (map[string]Options, map[string]ServiceState, error) {
 	var persisted persistedServices
 	if err := json.Unmarshal(data, &persisted); err != nil {
-		return nil, errors.Wrap(err, "failed to decode runtime metadata")
+		return nil, nil, errors.Wrap(err, "failed to decode runtime metadata")
 	}
 	if persisted.SchemaVersion != metadataSchemaVersion {
-		return nil, errors.Errorf(
+		return nil, nil, errors.Errorf(
 			"unsupported runtime metadata schema %d; refusing to start legacy mutable definitions",
 			persisted.SchemaVersion,
 		)
@@ -1076,35 +1129,89 @@ func decodeServices(data []byte) (map[string]Options, error) {
 	assigned := make(map[netip.Addr]string)
 	for name, options := range persisted.Services {
 		if name != options.Name {
-			return nil, errors.Errorf("runtime metadata key %q does not match definition name %q", name, options.Name)
+			return nil, nil, errors.Errorf("runtime metadata key %q does not match definition name %q", name, options.Name)
 		}
 		if err := validateStoredOptions(options); err != nil {
-			return nil, errors.Wrapf(err, "invalid stored runtime definition %q", name)
+			return nil, nil, errors.Wrapf(err, "invalid stored runtime definition %q", name)
 		}
 		if options.Isolation.Features.NetworkNamespaces {
 			continue
 		}
 		address, _ := netip.ParseAddr(options.ServiceBindAddress)
 		if other, duplicate := assigned[address]; duplicate {
-			return nil, errors.Errorf(
+			return nil, nil, errors.Errorf(
 				"runtime definitions %q and %q have duplicate service bind address %s",
 				other, name, address,
 			)
 		}
 		assigned[address] = name
 	}
-	return persisted.Services, nil
+
+	states, err := decodeStates(persisted)
+	if err != nil {
+		return nil, nil, err
+	}
+	return persisted.Services, states, nil
+}
+
+// decodeStates normalizes the persisted desired states. A state without a
+// definition, or an unrecognized state value, means the two halves of the file
+// disagree, which is a corruption signal rather than something to guess at.
+func decodeStates(persisted persistedServices) (map[string]ServiceState, error) {
+	states := make(map[string]ServiceState, len(persisted.Services))
+	for name := range persisted.Services {
+		states[name] = ServiceStatePassive
+	}
+	for name, state := range persisted.States {
+		if _, defined := persisted.Services[name]; !defined {
+			return nil, errors.Errorf("runtime metadata records state for unknown definition %q", name)
+		}
+		switch state {
+		case ServiceStateActive, ServiceStatePassive:
+			states[name] = state
+		default:
+			return nil, errors.Errorf("runtime definition %q has unknown stored state %q", name, state)
+		}
+	}
+	return states, nil
 }
 
 func (backend *RuncBackend) persistLocked() error {
+	states := make(map[string]ServiceState, len(backend.services))
+	for name := range backend.services {
+		if backend.desired[name] == ServiceStateActive {
+			states[name] = ServiceStateActive
+		} else {
+			states[name] = ServiceStatePassive
+		}
+	}
 	persisted := persistedServices{
 		SchemaVersion: metadataSchemaVersion,
 		Services:      backend.services,
+		States:        states,
 	}
 	if err := writeSecureJSON(backend.metadataPath, persisted); err != nil {
 		return errors.Wrap(err, "failed to write runtime metadata")
 	}
 	return nil
+}
+
+// setDesiredLocked records the state a definition should be in and persists it.
+// A failure to persist is reported but the in-memory state is kept, because the
+// workload has already been started or stopped and the caller must see that.
+func (backend *RuncBackend) setDesiredLocked(name string, state ServiceState) error {
+	if _, defined := backend.services[name]; !defined {
+		delete(backend.desired, name)
+		return nil
+	}
+	if backend.desired == nil {
+		backend.desired = make(map[string]ServiceState)
+	}
+	if backend.desired[name] == state {
+		return nil
+	}
+	backend.desired[name] = state
+	return backend.persistLocked()
 }
 
 func validateStoredOptions(options Options) error {
