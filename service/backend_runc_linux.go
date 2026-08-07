@@ -1247,8 +1247,8 @@ func extractImageRootFS(
 			if err != nil {
 				return errors.Wrapf(err, "missing hard link source %q for %q", header.Linkname, header.Name)
 			}
-			if !sourceInfo.Mode().IsRegular() && sourceInfo.Mode()&os.ModeSymlink == 0 {
-				return errors.Errorf("hard link source %q for %q is not a regular file or symlink", header.Linkname, header.Name)
+			if !sourceInfo.Mode().IsRegular() {
+				return errors.Errorf("hard link source %q for %q is not a regular file", header.Linkname, header.Name)
 			}
 			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 				return errors.Wrapf(err, "failed to create hard link parent for %q", targetPath)

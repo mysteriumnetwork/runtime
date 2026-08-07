@@ -493,6 +493,12 @@ func TestExtractImageRootFSRejectsUnsafeEntries(t *testing.T) {
 			{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755},
 			{Name: "usr/perl", Typeflag: tar.TypeLink, Linkname: "usr/bin/perl", Mode: 0o755},
 		},
+		"hard link to symlink source": {
+			{Name: "etc/", Typeflag: tar.TypeDir, Mode: 0o755},
+			{Name: "etc/nested/", Typeflag: tar.TypeDir, Mode: 0o755},
+			{Name: "etc/nested/link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd", Mode: 0o777},
+			{Name: "escape", Typeflag: tar.TypeLink, Linkname: "etc/nested/link", Mode: 0o777},
+		},
 		"root entry that is not a directory": {
 			{Name: ".", Typeflag: tar.TypeReg, Mode: 0o644},
 		},
