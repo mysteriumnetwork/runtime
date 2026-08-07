@@ -20,7 +20,10 @@
 package service
 
 import (
+	"archive/tar"
+	"bytes"
 	"encoding/json"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -32,6 +35,9 @@ import (
 
 	runc "github.com/containerd/go-runc"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
+	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	"github.com/opencontainers/runtime-spec/specs-go"
 )
 
@@ -392,6 +398,118 @@ func TestSecureJoinUnder(t *testing.T) {
 
 	if _, err := secureJoinUnder(root, "/etc/passwd"); err == nil {
 		t.Fatal("expected absolute path to be rejected")
+	}
+}
+
+// imageFromTarEntries builds a single-layer image whose layer tarball contains
+// the given entries, mirroring how base image rootfs layers are packed.
+func imageFromTarEntries(t *testing.T, entries []*tar.Header, contents map[string]string) v1.Image {
+	t.Helper()
+
+	var buffer bytes.Buffer
+	writer := tar.NewWriter(&buffer)
+	for _, header := range entries {
+		body := contents[header.Name]
+		if header.Typeflag == tar.TypeReg {
+			header.Size = int64(len(body))
+		}
+		if err := writer.WriteHeader(header); err != nil {
+			t.Fatalf("failed to write tar header %q: %v", header.Name, err)
+		}
+		if header.Typeflag == tar.TypeReg {
+			if _, err := io.WriteString(writer, body); err != nil {
+				t.Fatalf("failed to write tar body %q: %v", header.Name, err)
+			}
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("failed to close tar writer: %v", err)
+	}
+
+	payload := buffer.Bytes()
+	layer, err := tarball.LayerFromOpener(func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(payload)), nil
+	})
+	if err != nil {
+		t.Fatalf("failed to build layer: %v", err)
+	}
+	img, err := mutate.AppendLayers(empty.Image, layer)
+	if err != nil {
+		t.Fatalf("failed to build image: %v", err)
+	}
+	return img
+}
+
+// currentUserMappings map container root onto the calling user so that the
+// extractor's ownership mapping succeeds without privileges.
+func currentUserMappings() ([]specs.LinuxIDMapping, []specs.LinuxIDMapping) {
+	uid := []specs.LinuxIDMapping{{ContainerID: 0, HostID: uint32(os.Getuid()), Size: 1}}
+	gid := []specs.LinuxIDMapping{{ContainerID: 0, HostID: uint32(os.Getgid()), Size: 1}}
+	return uid, gid
+}
+
+func TestExtractImageRootFSHandlesRootEntryAndHardLinks(t *testing.T) {
+	rootfs := t.TempDir()
+	uidMappings, gidMappings := currentUserMappings()
+
+	img := imageFromTarEntries(t, []*tar.Header{
+		{Name: "./", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "usr/bin/", Typeflag: tar.TypeDir, Mode: 0o755},
+		{Name: "usr/bin/perl", Typeflag: tar.TypeReg, Mode: 0o755},
+		{Name: "usr/bin/perl5.40.1", Typeflag: tar.TypeLink, Linkname: "usr/bin/perl", Mode: 0o755},
+	}, map[string]string{"usr/bin/perl": "#!/bin/sh\n"})
+
+	if err := extractImageRootFS(img, rootfs, maxRootFSSize, uidMappings, gidMappings); err != nil {
+		t.Fatalf("expected extraction to succeed, got error: %v", err)
+	}
+
+	source, err := os.Stat(filepath.Join(rootfs, "usr/bin/perl"))
+	if err != nil {
+		t.Fatalf("expected hard link source to exist: %v", err)
+	}
+	link, err := os.Stat(filepath.Join(rootfs, "usr/bin/perl5.40.1"))
+	if err != nil {
+		t.Fatalf("expected hard link to exist: %v", err)
+	}
+	if !os.SameFile(source, link) {
+		t.Fatal("expected hard link to share an inode with its source")
+	}
+}
+
+func TestExtractImageRootFSRejectsUnsafeEntries(t *testing.T) {
+	uidMappings, gidMappings := currentUserMappings()
+
+	tests := map[string][]*tar.Header{
+		// Relative link targets that escape the rootfs are dropped by
+		// mutate.Extract before they reach the extractor, so they cannot be
+		// exercised here; secureJoinUnder covers that guard directly. Absolute
+		// targets are passed through unchanged and must be rejected by us.
+		"hard link to absolute host path": {
+			{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755},
+			{Name: "usr/passwd", Typeflag: tar.TypeLink, Linkname: "/etc/passwd", Mode: 0o644},
+		},
+		"hard link to missing source": {
+			{Name: "usr/", Typeflag: tar.TypeDir, Mode: 0o755},
+			{Name: "usr/perl", Typeflag: tar.TypeLink, Linkname: "usr/bin/perl", Mode: 0o755},
+		},
+		"root entry that is not a directory": {
+			{Name: ".", Typeflag: tar.TypeReg, Mode: 0o644},
+		},
+		"device node": {
+			{Name: "dev/", Typeflag: tar.TypeDir, Mode: 0o755},
+			{Name: "dev/null", Typeflag: tar.TypeChar, Mode: 0o666},
+		},
+	}
+
+	for description, entries := range tests {
+		t.Run(description, func(t *testing.T) {
+			img := imageFromTarEntries(t, entries, nil)
+			err := extractImageRootFS(img, t.TempDir(), maxRootFSSize, uidMappings, gidMappings)
+			if err == nil {
+				t.Fatalf("expected %s to be rejected", description)
+			}
+		})
 	}
 }
 

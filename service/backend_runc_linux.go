@@ -1235,7 +1235,35 @@ func extractImageRootFS(
 			if err := os.Symlink(symlinkTarget, targetPath); err != nil {
 				return errors.Wrapf(err, "failed to create symlink %q", targetPath)
 			}
-		case tar.TypeLink, tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
+		case tar.TypeLink:
+			linkSource, err := secureJoinUnder(rootfsPath, header.Linkname)
+			if err != nil {
+				return errors.Wrapf(err, "invalid hard link source %q for %q", header.Linkname, header.Name)
+			}
+			if err := ensureNoSymlinkParents(rootfsPath, linkSource); err != nil {
+				return errors.Wrapf(err, "unsafe hard link source %q for %q", header.Linkname, header.Name)
+			}
+			sourceInfo, err := os.Lstat(linkSource)
+			if err != nil {
+				return errors.Wrapf(err, "missing hard link source %q for %q", header.Linkname, header.Name)
+			}
+			if !sourceInfo.Mode().IsRegular() && sourceInfo.Mode()&os.ModeSymlink == 0 {
+				return errors.Errorf("hard link source %q for %q is not a regular file or symlink", header.Linkname, header.Name)
+			}
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+				return errors.Wrapf(err, "failed to create hard link parent for %q", targetPath)
+			}
+			if err := os.RemoveAll(targetPath); err != nil {
+				return errors.Wrapf(err, "failed to replace hard link %q", targetPath)
+			}
+			if err := os.Link(linkSource, targetPath); err != nil {
+				return errors.Wrapf(err, "failed to create hard link %q", targetPath)
+			}
+			// The inode is shared with an entry that was extracted earlier, so its
+			// ownership and timestamps are already mapped; re-applying them here
+			// would mutate the source file too.
+			continue
+		case tar.TypeChar, tar.TypeBlock, tar.TypeFifo:
 			return errors.Errorf("OCI rootfs entry %q uses forbidden file type %d", header.Name, header.Typeflag)
 		default:
 			return errors.Errorf("OCI rootfs entry %q uses unsupported file type %d", header.Name, header.Typeflag)
