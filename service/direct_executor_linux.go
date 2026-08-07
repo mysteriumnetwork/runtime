@@ -274,19 +274,57 @@ func writeSecureJSON(path string, value interface{}) error {
 	if err != nil {
 		return err
 	}
-	temporary := path + ".tmp"
-	if err := os.WriteFile(temporary, data, 0o600); err != nil {
+	return writeFileAtomic(path, data)
+}
+
+// writeFileAtomic replaces path so that an interrupted write leaves either the
+// previous content or the new content, never a truncated file. Both the
+// temporary file and the parent directory are synced, because a rename that
+// reaches the disk before the data behind it would reintroduce the truncated
+// state this is meant to prevent. The temporary name is unique so concurrent
+// writers to the same path cannot clobber each other's staging file.
+func writeFileAtomic(path string, data []byte) error {
+	directory := filepath.Dir(path)
+	temporary, err := os.CreateTemp(directory, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
 		return err
 	}
-	if err := os.Chmod(temporary, 0o600); err != nil {
-		_ = os.Remove(temporary)
+	temporaryPath := temporary.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = temporary.Close()
+			_ = os.Remove(temporaryPath)
+		}
+	}()
+
+	if err := temporary.Chmod(0o600); err != nil {
 		return err
 	}
-	if err := os.Rename(temporary, path); err != nil {
-		_ = os.Remove(temporary)
+	if _, err := temporary.Write(data); err != nil {
 		return err
 	}
-	return nil
+	if err := temporary.Sync(); err != nil {
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	committed = true
+
+	return syncDirectory(directory)
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func (backend *RuncBackend) directStatePath(name string) string {

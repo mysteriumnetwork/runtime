@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -96,9 +97,14 @@ type RuncBackend struct {
 	metadataPath string
 	runc         *runc.Runc
 	services     map[string]Options
-	initErr      error
-	status       RuntimeStatus
-	hostChecks   runtimeHostChecks
+	// pending holds service names whose bundle is being staged. Create releases
+	// mu while pulling the artifact, and this keeps two concurrent creates for
+	// the same name from racing each other's install.
+	pending    map[string]struct{}
+	initErr    error
+	status     RuntimeStatus
+	hostChecks runtimeHostChecks
+	notices    []string
 
 	caps         capabilities.RuntimeCapabilities
 	detailedCaps capabilities.DetailedCapabilities
@@ -124,6 +130,7 @@ func newRuncBackend(runtimeDir string) *RuncBackend {
 			LogFormat: runc.JSON,
 		},
 		services:     make(map[string]Options),
+		pending:      make(map[string]struct{}),
 		caps:         caps,
 		detailedCaps: detailedCaps,
 	}
@@ -135,6 +142,7 @@ func newRuncBackend(runtimeDir string) *RuncBackend {
 			probeDirectExecutor(backend.baseDir, backend.caps.NoNewPrivileges)
 	}
 	backend.status = assessRuntime(backend.caps, backend.initErr, backend.hostChecks)
+	backend.status.Notices = backend.notices
 	return backend
 }
 
@@ -190,35 +198,91 @@ func (backend *RuncBackend) Create(input CreateOptions) error {
 		return errors.Wrap(err, "oci_artifact must be an immutable digest reference")
 	}
 
+	stagingDir, err := backend.reserveStaging(input.Name)
+	if err != nil {
+		return err
+	}
+	defer backend.releaseStaging(input.Name, stagingDir)
+
+	// The registry pull and rootfs extraction write only into the reserved
+	// staging directory, so they deliberately run without the backend lock.
+	// Holding it here would stall every other operation for as long as
+	// imagePullTimeout, including the per-connection DialTCP that the proxy uses
+	// to reach workloads that are already running. The isolation profile is
+	// fixed at construction, so passing it in keeps that independence explicit.
+	preparedOptions, err := backend.prepareBundle(input, stagingDir, backend.status.Profile)
+	if err != nil {
+		return err
+	}
+
+	return backend.installBundle(input, preparedOptions, stagingDir)
+}
+
+// reserveStaging validates the create preconditions and claims the service name
+// so that a concurrent create for the same name cannot interleave with this
+// one while the backend lock is released for the pull. It returns the staging
+// directory to extract into.
+func (backend *RuncBackend) reserveStaging(serviceName string) (string, error) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 
+	if _, pending := backend.pending[serviceName]; pending {
+		return "", errors.Errorf("runtime service %q is already being created", serviceName)
+	}
+	if err := backend.checkCreateAllowedLocked(serviceName); err != nil {
+		return "", err
+	}
+
+	stagingDir, err := os.MkdirTemp(backend.bundlesDir, "."+serviceName+"-staging-")
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to stage bundle for %q", serviceName)
+	}
+	if err := os.Chmod(stagingDir, 0o711); err != nil {
+		_ = os.RemoveAll(stagingDir)
+		return "", errors.Wrapf(err, "failed to make staged bundle traversable for %q", serviceName)
+	}
+	if err := os.MkdirAll(filepath.Join(stagingDir, rootfsDirName), 0o755); err != nil {
+		_ = os.RemoveAll(stagingDir)
+		return "", errors.Wrapf(err, "failed to create bundle rootfs for %q", serviceName)
+	}
+
+	backend.pending[serviceName] = struct{}{}
+	return stagingDir, nil
+}
+
+// releaseStaging drops the name reservation and removes the staging directory.
+// A successful install has already renamed it away, so the removal is a no-op
+// on that path.
+func (backend *RuncBackend) releaseStaging(serviceName, stagingDir string) {
+	backend.mu.Lock()
+	delete(backend.pending, serviceName)
+	backend.mu.Unlock()
+
+	_ = os.RemoveAll(stagingDir)
+}
+
+func (backend *RuncBackend) checkCreateAllowedLocked(serviceName string) error {
 	active, err := backend.activeLocked()
 	if err != nil {
 		return err
 	}
-	if _, active := active[input.Name]; active {
-		return errors.Errorf("runtime service %q is active", input.Name)
+	if _, running := active[serviceName]; running {
+		return errors.Errorf("runtime service %q is active", serviceName)
 	}
-	if _, updating := backend.services[input.Name]; !updating && len(backend.services) >= maxInstalledServices {
+	if _, updating := backend.services[serviceName]; !updating && len(backend.services) >= maxInstalledServices {
 		return errors.Errorf("at most %d runtime services may be installed", maxInstalledServices)
 	}
+	return nil
+}
 
-	bundleDir := backend.bundleDir(input.Name)
-	stagingDir, err := os.MkdirTemp(backend.bundlesDir, "."+input.Name+"-staging-")
-	if err != nil {
-		return errors.Wrapf(err, "failed to stage bundle for %q", input.Name)
-	}
-	defer os.RemoveAll(stagingDir)
-	if err := os.Chmod(stagingDir, 0o711); err != nil {
-		return errors.Wrapf(err, "failed to make staged bundle traversable for %q", input.Name)
-	}
-	if err := os.MkdirAll(filepath.Join(stagingDir, rootfsDirName), 0o755); err != nil {
-		return errors.Wrapf(err, "failed to create bundle rootfs for %q", input.Name)
-	}
+// installBundle atomically swaps the staged bundle in and records the
+// definition. It re-checks the create preconditions because the backend lock
+// was released while the artifact was pulled.
+func (backend *RuncBackend) installBundle(input CreateOptions, preparedOptions Options, stagingDir string) error {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
 
-	preparedOptions, err := backend.prepareBundleLocked(input, stagingDir)
-	if err != nil {
+	if err := backend.checkCreateAllowedLocked(input.Name); err != nil {
 		return err
 	}
 	if err := backend.assignServiceBindAddressLocked(&preparedOptions); err != nil {
@@ -231,6 +295,7 @@ func (backend *RuncBackend) Create(input CreateOptions) error {
 		}
 	}
 
+	bundleDir := backend.bundleDir(input.Name)
 	backupDir := filepath.Join(backend.bundlesDir, "."+input.Name+"-previous")
 	if err := os.RemoveAll(backupDir); err != nil {
 		return errors.Wrapf(err, "failed to clear previous bundle backup for %q", input.Name)
@@ -716,7 +781,14 @@ func (backend *RuncBackend) activeLocked() (map[string]struct{}, error) {
 	return active, nil
 }
 
-func (backend *RuncBackend) prepareBundleLocked(input CreateOptions, bundleDir string) (Options, error) {
+// prepareBundle pulls the artifact and extracts it into bundleDir. It runs
+// without the backend lock and must not touch shared backend state; the profile
+// it applies is passed in rather than read from the backend.
+func (backend *RuncBackend) prepareBundle(
+	input CreateOptions,
+	bundleDir string,
+	profile IsolationProfile,
+) (Options, error) {
 	ref, err := name.NewDigest(input.OCIArtifact, name.StrictValidation)
 	if err != nil {
 		return Options{}, errors.Wrap(err, "failed to parse immutable OCI artifact reference")
@@ -741,7 +813,6 @@ func (backend *RuncBackend) prepareBundleLocked(input CreateOptions, bundleDir s
 	if err != nil {
 		return Options{}, err
 	}
-	profile := backend.status.Profile
 	uidMappings, gidMappings, err := rootFSOwnershipMappings(profile)
 	if err != nil {
 		return Options{}, err
@@ -948,9 +1019,47 @@ func (backend *RuncBackend) loadServices() (map[string]Options, error) {
 		if os.IsNotExist(err) {
 			return make(map[string]Options), nil
 		}
+		// A metadata file that exists but cannot be read is a host problem, not
+		// a content problem. Discarding definitions here could hide a transient
+		// I/O or permission fault, so this stays fatal.
 		return nil, errors.Wrap(err, "failed to read runtime metadata")
 	}
 
+	services, decodeErr := decodeServices(data)
+	if decodeErr == nil {
+		return services, nil
+	}
+
+	// Unusable content is never executed, so moving it aside and starting empty
+	// is strictly safer than refusing to run: an interrupted write or a
+	// downgraded schema would otherwise leave the runtime permanently
+	// unavailable with no in-process recovery path. Bundles left on disk are
+	// inert without a definition referencing them.
+	quarantinePath, err := backend.quarantineMetadata()
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to quarantine unusable runtime metadata (%s)", decodeErr)
+	}
+	backend.notices = append(backend.notices, fmt.Sprintf(
+		"unusable runtime metadata was moved to %s and all runtime definitions were discarded: %s",
+		quarantinePath, decodeErr,
+	))
+	return make(map[string]Options), nil
+}
+
+// quarantineMetadata moves the current metadata file aside for operator
+// inspection and returns its new path.
+func (backend *RuncBackend) quarantineMetadata() (string, error) {
+	quarantinePath := fmt.Sprintf("%s.unusable-%d", backend.metadataPath, time.Now().UnixNano())
+	if err := os.Rename(backend.metadataPath, quarantinePath); err != nil {
+		return "", err
+	}
+	if err := syncDirectory(filepath.Dir(backend.metadataPath)); err != nil {
+		return "", err
+	}
+	return quarantinePath, nil
+}
+
+func decodeServices(data []byte) (map[string]Options, error) {
 	var persisted persistedServices
 	if err := json.Unmarshal(data, &persisted); err != nil {
 		return nil, errors.Wrap(err, "failed to decode runtime metadata")
@@ -992,12 +1101,7 @@ func (backend *RuncBackend) persistLocked() error {
 		SchemaVersion: metadataSchemaVersion,
 		Services:      backend.services,
 	}
-	data, err := json.MarshalIndent(persisted, "", "  ")
-	if err != nil {
-		return errors.Wrap(err, "failed to encode runtime metadata")
-	}
-
-	if err := os.WriteFile(backend.metadataPath, data, 0o600); err != nil {
+	if err := writeSecureJSON(backend.metadataPath, persisted); err != nil {
 		return errors.Wrap(err, "failed to write runtime metadata")
 	}
 	return nil
