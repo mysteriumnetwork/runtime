@@ -1166,6 +1166,15 @@ func extractImageRootFS(
 			return errors.Wrap(err, "failed to read extracted OCI tar stream")
 		}
 
+		if isRootTarEntry(header.Name) {
+			// Layers packed as `tar -C rootfs .` carry an entry for the rootfs
+			// directory itself, whose ownership and mode are already applied above.
+			if header.Typeflag != tar.TypeDir {
+				return errors.Errorf("OCI rootfs entry %q is not a directory", header.Name)
+			}
+			continue
+		}
+
 		targetPath, err := secureJoinUnder(rootfsPath, header.Name)
 		if err != nil {
 			return errors.Wrapf(err, "invalid OCI tar entry path %q", header.Name)
@@ -1724,6 +1733,11 @@ func cgroupPathForService(name string) (string, error) {
 		return "", err
 	}
 	return filepath.Join(parent, "mysterium-"+builder.String()), nil
+}
+
+func isRootTarEntry(tarPath string) bool {
+	clean := filepath.Clean(filepath.FromSlash(tarPath))
+	return clean == "." || clean == string(os.PathSeparator)
 }
 
 func secureJoinUnder(root, tarPath string) (string, error) {

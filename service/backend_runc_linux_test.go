@@ -395,6 +395,22 @@ func TestSecureJoinUnder(t *testing.T) {
 	}
 }
 
+func TestIsRootTarEntry(t *testing.T) {
+	roots := []string{".", "./", "/", "", "./."}
+	for _, name := range roots {
+		if !isRootTarEntry(name) {
+			t.Fatalf("expected entry %q to be the rootfs directory", name)
+		}
+	}
+
+	nonRoots := []string{"bin", "./bin", "/etc/passwd", "..", "\x00"}
+	for _, name := range nonRoots {
+		if isRootTarEntry(name) {
+			t.Fatalf("expected entry %q not to be the rootfs directory", name)
+		}
+	}
+}
+
 func TestSecureSymlinkTarget(t *testing.T) {
 	root := t.TempDir()
 	linkPath := filepath.Join(root, "usr", "bin", "tool")
